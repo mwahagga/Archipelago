@@ -1,0 +1,8 @@
+# Unit test suite
+test/
+
+
+# Debug & temporary files
+*.CT
+*.log
+dump_ui.py

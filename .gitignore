@@ -12,6 +12,7 @@
 *.aptloz
 *.aptww
 *.apemerald
+*.aphalo3
 *.pyc
 *.pyd
 *.sfc
@@ -77,6 +78,7 @@ __pycache__/
 # C extensions
 *.so
 *.dll
+!worlds/halo3/mod/*.dll
 
 # Distribution / packaging
 .Python
@@ -199,3 +201,7 @@ _speedups.html
 .LSOverride
 Thumbs.db
 [Dd]esktop.ini
+
+# Halo 3 Mod debug and Cheat Engine tables
+*.CT
+dump_ui.py
