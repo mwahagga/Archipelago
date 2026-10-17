@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from worlds.halo3 import client as Halo3Client
 from worlds.halo3 import launcher
+import subprocess
 from worlds.halo3.launcher import (
     detect_mcc_path,
     get_bundled_dxgi_path,
@@ -14,6 +15,7 @@ from worlds.halo3.launcher import (
     deploy_mod,
     cleanup_mod,
     launch_mcc,
+    spawn_watchdog,
     MCC_EXE_REL_PATH,
     DXGI_REL_PATH,
 )
@@ -136,6 +138,25 @@ class TestLaunchWorkflow(unittest.TestCase):
         dxgi_dest = os.path.join(self.win64_dir, "dxgi.dll")
         mock_watchdog.assert_called_once_with(12345, dxgi_dest)
 
+    @patch("worlds.halo3.launcher.spawn_watchdog")
+    @patch("worlds.halo3.launcher.get_mcc_pid", return_value=54321)
+    @patch("os.startfile", create=True)
+    @patch("worlds.halo3.launcher.is_mcc_running", return_value=False)
+    def test_launch_mcc_steam_success(
+        self, mock_running: MagicMock, mock_startfile: MagicMock, mock_get_pid: MagicMock, mock_watchdog: MagicMock
+    ) -> None:
+        """launch_mcc via Steam URL returns LaunchedProcess with PID and spawns watchdog."""
+        steam_dir = os.path.join(self.temp_dir, "steamapps", "common", "Halo The Master Chief Collection")
+        win64_dir = os.path.join(steam_dir, "mcc", "binaries", "win64")
+        os.makedirs(win64_dir, exist_ok=True)
+        with open(os.path.join(win64_dir, "MCC-Win64-Shipping.exe"), "w") as f:
+            f.write("mock")
+
+        proc = launch_mcc(steam_dir)
+        self.assertIsNotNone(proc)
+        self.assertEqual(proc.pid, 54321)
+        mock_watchdog.assert_called_once_with(54321, os.path.join(win64_dir, "dxgi.dll"))
+
     @patch("worlds.halo3.launcher.is_mcc_running", return_value=True)
     def test_launch_aborts_if_mcc_already_running(self, mock_running: MagicMock) -> None:
         """launch_mcc must not launch a second instance if MCC is already running."""
@@ -224,4 +245,42 @@ class TestHalo3PatchContainer(unittest.TestCase):
             self.assertEqual(parsed.name, "Chief")
             self.assertEqual(parsed.connect, "archipelago.gg:38281")
             self.assertTrue(parsed.launch)
+
+
+class TestSpawnWatchdog(unittest.TestCase):
+    def test_spawn_watchdog_noop_for_invalid_input(self) -> None:
+        """spawn_watchdog should do nothing if PID <= 0 or path is empty."""
+        with patch("subprocess.Popen") as mock_popen:
+            spawn_watchdog(0, r"C:\test\dxgi.dll")
+            spawn_watchdog(-1, r"C:\test\dxgi.dll")
+            spawn_watchdog(1234, "")
+            mock_popen.assert_not_called()
+
+    @patch("subprocess.Popen")
+    def test_spawn_watchdog_windows_flags(self, mock_popen: MagicMock) -> None:
+        """On Windows, spawn_watchdog configures CREATE_NO_WINDOW and SW_HIDE with DEVNULL streams."""
+        with patch("sys.platform", "win32"), patch("os.path.isfile", return_value=True):
+            spawn_watchdog(12345, r"C:\test\dxgi.dll")
+            mock_popen.assert_called_once()
+            _, kwargs = mock_popen.call_args
+            self.assertEqual(kwargs.get("stdin"), subprocess.DEVNULL)
+            self.assertEqual(kwargs.get("stdout"), subprocess.DEVNULL)
+            self.assertEqual(kwargs.get("stderr"), subprocess.DEVNULL)
+            self.assertEqual(kwargs.get("creationflags"), 0x08000000)
+            startupinfo = kwargs.get("startupinfo")
+            self.assertIsNotNone(startupinfo)
+            self.assertEqual(startupinfo.wShowWindow, 0)
+
+    @patch("subprocess.Popen")
+    def test_spawn_watchdog_linux_flags(self, mock_popen: MagicMock) -> None:
+        """On Linux, spawn_watchdog sets start_new_session=True with DEVNULL streams."""
+        with patch("sys.platform", "linux"):
+            spawn_watchdog(12345, "/opt/mcc/dxgi.dll")
+            mock_popen.assert_called_once()
+            _, kwargs = mock_popen.call_args
+            self.assertEqual(kwargs.get("stdin"), subprocess.DEVNULL)
+            self.assertEqual(kwargs.get("stdout"), subprocess.DEVNULL)
+            self.assertEqual(kwargs.get("stderr"), subprocess.DEVNULL)
+            self.assertTrue(kwargs.get("start_new_session"))
+            self.assertNotIn("creationflags", kwargs)
 

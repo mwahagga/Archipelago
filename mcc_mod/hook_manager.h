@@ -14,4 +14,7 @@ bool InstallHooks();
 // Removes in-engine hooks
 void RemoveHooks();
 
+// Signals the background monitor thread to terminate immediately (used during process detach)
+void StopMonitor();
+
 } // namespace Halo3AP

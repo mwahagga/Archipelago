@@ -3,7 +3,9 @@
 #include "../memory_utils.h"
 #include "../offsets.h"
 #include "../engine/object_table.h"
+#include "shell_command.h"
 #include <set>
+#include <unordered_set>
 
 namespace Halo3AP {
 
@@ -58,6 +60,9 @@ bool WasGameWonFired() {
     return s_gameWonFired;
 }
 
+static std::mutex s_skullSessionMtx;
+static std::unordered_set<std::string> s_awardedSkullsInSession;
+
 void ResetEventState() {
     std::lock_guard<std::mutex> lock(g_modState.mtx);
     s_unlockedRallies.clear();
@@ -65,6 +70,12 @@ void ResetEventState() {
     s_gameWonFired = false;
     s_terminalBitmaskInitialized = false;
     s_initialTerminalBitmask = 0;
+    g_quitAfterComplete.store(false);
+    {
+        std::lock_guard<std::mutex> sLock(s_skullSessionMtx);
+        s_awardedSkullsInSession.clear();
+    }
+    ResetShieldAndDeathLinkState();
     Log("[EVENT] Event state reset for new level session.");
 }
 
@@ -289,6 +300,108 @@ void __fastcall Detour_AwardSecondarySkull(int32_t playerDatum, int32_t skullInd
     }
 }
 
+// Direct pickup / inventory skull award verification
+// Called whenever Chief equips a weapon or periodically during inventory checks.
+// Eliminates dependence on Bungie's campaign HS scripts (which fail to wake on Easy or from checkpoints).
+void CheckAndAwardSkullIfHolding(uintptr_t halo3Base, uint32_t playerDatum, void* weaponObj, void* tagDef) {
+    if (!weaponObj || !tagDef) return;
+
+    if (!IsValidRead(tagDef, 0x190)) return;
+    uint16_t weaponType = *(uint16_t*)((uintptr_t)tagDef + 0x18C);
+    // 11 = _weapon_type_ball (skulls and oddball)
+    if (weaponType != 11) return;
+
+    if (!IsValidRead(weaponObj, 0x100)) return;
+    uint16_t nameIdx = *(uint16_t*)((uintptr_t)weaponObj + 0xE8);
+
+    std::string scen = GetCurrentScenarioCode();
+    if (scen.empty()) return;
+
+    bool isSecondary = false;
+    if (IsValidRead((void*)((uintptr_t)tagDef + 0x4E8), sizeof(uint32_t))) {
+        uint32_t val4e8 = *(uint32_t*)((uintptr_t)tagDef + 0x4E8);
+        if (val4e8 != 0) {
+            isSecondary = true;
+        }
+        Log("[Skull] Inspecting skull tagDef=%p, val4e8=0x%08X -> isSecondary=%d",
+            tagDef, val4e8, isSecondary ? 1 : 0);
+    }
+
+    int primaryIndex = -1;
+    int secondaryIndex = -1;
+
+    if (scen.find("010_jungle") != std::string::npos) {
+        // Sierra 117: Iron (Primary 0) vs Blind (Secondary 0)
+        if (isSecondary) {
+            secondaryIndex = 0;
+        } else {
+            primaryIndex = 0;
+        }
+    } else if (scen.find("020_base") != std::string::npos) {
+        // Crow's Nest: Black Eye (Primary 1) vs Grunt Birthday (Secondary 1)
+        if (isSecondary) {
+            secondaryIndex = 1;
+        } else {
+            primaryIndex = 1;
+        }
+    } else if (scen.find("030_outskirts") != std::string::npos || scen.find("030_docks") != std::string::npos) {
+        // Tsavo Highway: Tough Luck (Primary 2)
+        primaryIndex = 2;
+    } else if (scen.find("040_voi") != std::string::npos) {
+        // The Storm: Catch (Primary 3)
+        primaryIndex = 3;
+    } else if (scen.find("050_flood") != std::string::npos) {
+        // Floodgate: Fog (Primary 4)
+        primaryIndex = 4;
+    } else if (scen.find("070_waste") != std::string::npos || scen.find("060_island") != std::string::npos) {
+        // The Ark: Famine (Primary 5) vs Cowbell (Secondary 2)
+        if (isSecondary) {
+            secondaryIndex = 2;
+        } else {
+            primaryIndex = 5;
+        }
+    } else if (scen.find("100_citadel") != std::string::npos) {
+        // The Covenant: Thunderstorm (Primary 6) vs IWHBYD (Secondary 3)
+        if (isSecondary) {
+            secondaryIndex = 3;
+        } else {
+            primaryIndex = 6;
+        }
+    } else if (scen.find("110_hc") != std::string::npos || scen.find("080_ship") != std::string::npos) {
+        // Cortana: Tilt (Primary 7)
+        primaryIndex = 7;
+    } else if (scen.find("120_halo") != std::string::npos || scen.find("090_sacrifice") != std::string::npos) {
+        // Halo: Mythic (Primary 8)
+        primaryIndex = 8;
+    }
+
+    if (primaryIndex >= 0) {
+        std::string key = "primary_" + std::to_string(primaryIndex) + ":" + scen;
+        bool isFirst = false;
+        {
+            std::lock_guard<std::mutex> lock(s_skullSessionMtx);
+            isFirst = s_awardedSkullsInSession.insert(key).second;
+        }
+        if (isFirst) {
+            Log("[EVENT] Direct skull pickup detected! player=0x%08X, primaryIndex=%d (nameIdx=%u, scen=%s)",
+                playerDatum, primaryIndex, nameIdx, scen.c_str());
+            Detour_AwardPrimarySkull(playerDatum, primaryIndex);
+        }
+    } else if (secondaryIndex >= 0) {
+        std::string key = "secondary_" + std::to_string(secondaryIndex) + ":" + scen;
+        bool isFirst = false;
+        {
+            std::lock_guard<std::mutex> lock(s_skullSessionMtx);
+            isFirst = s_awardedSkullsInSession.insert(key).second;
+        }
+        if (isFirst) {
+            Log("[EVENT] Direct skull pickup detected! player=0x%08X, secondaryIndex=%d (nameIdx=%u, scen=%s)",
+                playerDatum, secondaryIndex, nameIdx, scen.c_str());
+            Detour_AwardSecondarySkull(playerDatum, secondaryIndex);
+        }
+    }
+}
+
 // ============================================================================
 // MISSION COMPLETION — game_won hook
 // ============================================================================
@@ -317,6 +430,8 @@ void __fastcall Detour_GameWon(void* rcxParam, int32_t edxParam) {
             }
             g_modState.pendingEvents.insert(eventKey);
         }
+        // Signal IGameEngine::ShellCommand hook to cleanly teardown to menu
+        g_quitAfterComplete.store(true);
     }
 
     // Let the original game_won execute so engine state is properly updated

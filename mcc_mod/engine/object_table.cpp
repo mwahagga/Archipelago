@@ -1,5 +1,6 @@
 #include "object_table.h"
 #include "tag_system.h"
+#include "../hooks/event_hooks.h"
 #include "../memory_utils.h"
 #include "../pipe_server.h"
 #include "../offsets.h"
@@ -92,6 +93,51 @@ bool IsPlayerUnit(uintptr_t halo3Base, uint32_t unitDatum) {
     return false;
 }
 
+bool UnitHasAnyWeapon(void* unitObj) {
+    if (!unitObj || !IsValidRead(unitObj, Halo3Offsets::H3_UNIT_INVENTORY + 16)) return false;
+    uint32_t* inv = (uint32_t*)((uintptr_t)unitObj + Halo3Offsets::H3_UNIT_INVENTORY);
+    for (int slot = 0; slot < 4; ++slot) {
+        uint32_t wDatum = inv[slot];
+        if (wDatum != 0xFFFFFFFF && wDatum != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ChiefHasAnyWeapon(uintptr_t halo3Base) {
+    if (!halo3Base) return false;
+    uint32_t chief = g_localPlayerDatum.load();
+    if (chief == 0xFFFFFFFF || chief == 0) {
+        uint32_t* pTlsIndex = (uint32_t*)(halo3Base + Halo3Offsets::H3_TLS_INDEX);
+        if (pTlsIndex && IsValidRead(pTlsIndex, sizeof(uint32_t))) {
+            uint32_t tlsIndex = *pTlsIndex;
+            if (tlsIndex < 128) {
+                uint64_t gs58 = ReadGs58();
+                uint64_t* tlsArray = (uint64_t*)gs58;
+                if (tlsArray && IsValidRead(&tlsArray[tlsIndex], sizeof(uint64_t))) {
+                    uintptr_t threadData = tlsArray[tlsIndex];
+                    if (threadData && IsValidRead((void*)threadData, 0x100)) {
+                        uintptr_t playerTable = *(uintptr_t*)(threadData + 0x10);
+                        if (playerTable && IsValidRead((void*)playerTable, 0x50)) {
+                            uintptr_t tableData = *(uintptr_t*)(playerTable + 0x48);
+                            if (tableData && IsValidRead((void*)tableData, 0x50)) {
+                                chief = *(uint32_t*)(tableData + 0x28);
+                                if (chief != 0xFFFFFFFF && chief != 0) {
+                                    g_localPlayerDatum.store(chief);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (chief == 0xFFFFFFFF || chief == 0) return false;
+    void* chiefObj = GetObjectPtr(halo3Base, chief);
+    return UnitHasAnyWeapon(chiefObj);
+}
+
 void CheckAndEnforcePlayerInventory(uintptr_t halo3Base) {
     if (!halo3Base) return;
 
@@ -149,6 +195,9 @@ void CheckAndEnforcePlayerInventory(uintptr_t halo3Base) {
                 void* tagDef = GetTagDefinition(halo3Base, tagDatum);
                 const char* wname = GetWeaponNameFromTag(tagIndex, tagDef);
 
+                // Direct campaign skull check: if Chief has a skull in inventory, award it!
+                CheckAndAwardSkullIfHolding(halo3Base, chiefDatum, wObj, tagDef);
+
                 bool unlocked = IsTagUnlocked(halo3Base, tagIndex, tagDef, true);
 
                 if (!unlocked) {
@@ -166,4 +215,169 @@ void CheckAndEnforcePlayerInventory(uintptr_t halo3Base) {
     }
 }
 
+static uint32_t s_prevChiefDatum = 0;
+static float    s_prevShield = 1.0f;
+static int      s_damageCooldownTicks = 0;
+static bool     s_wasChiefAlive = false;
+static int      s_deathCooldownTicks = 0;
+static int      s_spawnGraceTicks = 180;
+
+void ResetShieldAndDeathLinkState() {
+    g_localPlayerDatum.store(0xFFFFFFFF);
+    // Note: g_pendingDeathLinkEffect is preserved so penalties queued in menus execute on spawn
+    s_prevChiefDatum = 0;
+    s_prevShield = 1.0f;
+    s_damageCooldownTicks = 0;
+    s_wasChiefAlive = false;
+    s_deathCooldownTicks = 0;
+    s_spawnGraceTicks = 180;
+    Log("[DeathLink] Shield and DeathLink state reset (pending penalty preserved).");
+}
+
+void EnforcePlayerShields(uintptr_t halo3Base) {
+    if (!halo3Base) return;
+    uint32_t chiefDatum = g_localPlayerDatum.load();
+    if (chiefDatum == 0xFFFFFFFF || chiefDatum == 0) return;
+
+    void* chiefObj = GetObjectPtr(halo3Base, chiefDatum);
+    if (!chiefObj || !IsValidRead(chiefObj, Halo3Offsets::H3_UNIT_SHIELD + sizeof(float))) return;
+
+    float* pShield = (float*)((uintptr_t)chiefObj + Halo3Offsets::H3_UNIT_SHIELD);
+    float* pHealth = (float*)((uintptr_t)chiefObj + Halo3Offsets::H3_UNIT_HEALTH);
+    if (!IsValidRead(pShield, sizeof(float)) || !IsValidRead(pHealth, sizeof(float))) return;
+
+    float currentHealth = *pHealth;
+    float currentShield = *pShield;
+
+    // Detect Chief datum transition (spawning into a new map or respawning)
+    if (chiefDatum != s_prevChiefDatum) {
+        s_prevChiefDatum = chiefDatum;
+        s_prevShield = currentShield;
+        s_damageCooldownTicks = 0;
+        s_wasChiefAlive = (currentHealth > 0.50f);
+        s_spawnGraceTicks = 180; // ~6 seconds grace period on spawn/load
+        s_deathCooldownTicks = 180;
+        return;
+    }
+
+    // Spawn grace period: allow level initialization, scripting, and fade-in to complete
+    if (s_spawnGraceTicks > 0) {
+        s_spawnGraceTicks--;
+        if (currentHealth > 0.50f) {
+            s_wasChiefAlive = true;
+        }
+        return;
+    }
+
+    // 1. Detect local death to report to Archipelago via DeathLink
+    if (s_deathCooldownTicks > 0) {
+        s_deathCooldownTicks--;
+    }
+
+    if (currentHealth <= 0.001f) {
+        if (s_wasChiefAlive && s_deathCooldownTicks == 0) {
+            Log("[DeathLink] Local death detected (Chief health=%.2f)! Queueing event...", currentHealth);
+            {
+                std::lock_guard<std::mutex> lock(g_modState.mtx);
+                g_modState.pendingEvents.insert("player_death");
+            }
+            s_deathCooldownTicks = 200; // ~7 seconds cooldown
+        }
+        s_wasChiefAlive = false;
+        return; // Chief is dead; skip penalty execution and shield enforcement
+    } else if (currentHealth > 0.50f) {
+        s_wasChiefAlive = true;
+    }
+
+    // 2. Process pending DeathLink effect received from client
+    // Defer penalty execution until Chief is in active gameplay (has weapons and health > 50%)
+    if (currentHealth > 0.50f && ChiefHasAnyWeapon(halo3Base)) {
+        int dlEffect = g_pendingDeathLinkEffect.exchange(0);
+        if (dlEffect != 0) {
+            if (dlEffect == 1) { // Kill
+                Log("[DeathLink] EXECUTING KILL on Master Chief (datum 0x%08X)!", chiefDatum);
+                *pShield = 0.0f;
+                *pHealth = 0.0f;
+                s_wasChiefAlive = false;
+                s_deathCooldownTicks = 300; // ~10 seconds cooldown to suppress local death feedback loop
+                typedef void(__fastcall *FnObjectKill)(uint32_t objectDatum);
+                FnObjectKill pfnKill = (FnObjectKill)(halo3Base + Halo3Offsets::H3_OBJECT_KILL);
+                pfnKill(chiefDatum);
+                return;
+            } else if (dlEffect == 2) { // Shield Break (EMP)
+                Log("[DeathLink] EXECUTING SHIELD BREAK on Master Chief!");
+                *pShield = 0.0f;
+                uint16_t* pDelay = (uint16_t*)((uintptr_t)chiefObj + Halo3Offsets::H3_UNIT_RECHARGE_DELAY);
+                if (IsValidRead(pDelay, sizeof(uint16_t))) {
+                    *pDelay = 240; // ~4 seconds EMP recharge delay (at 60Hz)
+                }
+            } else if (dlEffect == 3) { // Mortal (Shield 0%, Health 10%)
+                Log("[DeathLink] EXECUTING MORTAL DAMAGE on Master Chief!");
+                *pShield = 0.0f;
+                *pHealth = 0.10f;
+                uint16_t* pDelay = (uint16_t*)((uintptr_t)chiefObj + Halo3Offsets::H3_UNIT_RECHARGE_DELAY);
+                if (IsValidRead(pDelay, sizeof(uint16_t))) {
+                    *pDelay = 240; // ~4 seconds recharge delay
+                }
+            }
+        }
+    }
+
+    float maxFrac = g_maxShieldFraction.load();
+
+    // Detect if Chief took damage this tick
+    if (currentShield < s_prevShield - 0.0001f) {
+        // ~5 seconds delay (150 simulation ticks) before overshield recharge begins
+        s_damageCooldownTicks = 150;
+    } else if (s_damageCooldownTicks > 0) {
+        s_damageCooldownTicks--;
+    }
+
+    // 1. Glass cannon (0% shields): completely eliminate shield vitality
+    if (maxFrac <= 0.001f) {
+        *pShield = 0.0f;
+        s_prevShield = 0.0f;
+        uint32_t* pFlags = (uint32_t*)((uintptr_t)chiefObj + Halo3Offsets::H3_UNIT_FLAGS);
+        if (IsValidRead(pFlags, sizeof(uint32_t))) {
+            *pFlags &= ~0x400;
+        }
+        return;
+    }
+
+    // 2. Restricted shields (< 100%): clamp engine recharge to maxFrac
+    if (maxFrac < 1.0f) {
+        if (currentShield > maxFrac) {
+            *pShield = maxFrac;
+            currentShield = maxFrac;
+        }
+        if (currentShield >= maxFrac - 0.001f) {
+            uint32_t* pFlags = (uint32_t*)((uintptr_t)chiefObj + Halo3Offsets::H3_UNIT_FLAGS);
+            if (IsValidRead(pFlags, sizeof(uint32_t))) {
+                *pFlags &= ~0x400;
+            }
+        }
+        s_prevShield = currentShield;
+        return;
+    }
+
+    // 3. Overshield (> 100%):
+    // When base shields are fully recharged (*pShield >= 1.0f) and Chief has not taken damage
+    // for the cooldown period, steadily recharge into overshield up to maxFrac.
+    if (maxFrac > 1.0f) {
+        if (currentShield >= 1.0f && currentShield < maxFrac && s_damageCooldownTicks == 0) {
+            currentShield += 0.008f;
+            if (currentShield > maxFrac) {
+                currentShield = maxFrac;
+            }
+            *pShield = currentShield;
+        } else if (currentShield > maxFrac) {
+            currentShield = maxFrac;
+            *pShield = currentShield;
+        }
+    }
+
+    s_prevShield = currentShield;
+}
+
 } // namespace Halo3AP
+

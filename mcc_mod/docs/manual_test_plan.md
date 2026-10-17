@@ -7,6 +7,8 @@ This manual test plan provides comprehensive, step-by-step verification procedur
 - **In-DLL Anti-Cheat Safety Failsafe (0 Ban Risk)**
 - **Named Pipe IPC & Client Synchronization (`Halo3Client.py`)**
 - **Native In-Game Engine Hooks & Campaign Mechanics (`dxgi.dll`)**
+- **Dynamic MJOLNIR Shield Capacity Management (Progressive & Glass Cannon Modes)**
+- **DeathLink Multiworld Penalties & Dual-Layer Feedback Suppression (`Kill`, `Shield Break`, `Mortal`)**
 
 ---
 
@@ -48,7 +50,7 @@ Before running manual tests, run automated static analysis:
 $env:SKIP_REQUIREMENTS_UPDATE="1"
 .\.venv\Scripts\python.exe -m unittest discover -t . -s worlds/halo3/test -v
 ```
-* **Expected Result**: All 101 tests pass (`OK`).
+* **Expected Result**: All 163 tests pass (`OK`).
 
 ---
 
@@ -407,7 +409,7 @@ $env:SKIP_REQUIREMENTS_UPDATE="1"
 #### TC-19: In-Game Event Checks (Skulls, Terminals & Rally Points)
 * **Objective**: Verify collecting campaign collectibles fires native hooks and sends checks instantly.
 * **Steps**:
-  1. Start Sierra 117 on **Normal difficulty or higher** from Rally Point Alpha (skulls do not spawn on Easy or from mid-mission rally points).
+  1. Start Sierra 117 on any difficulty (including Easy) and from any rally point (vanilla Easy difficulty and mid-mission insertion point restrictions bypassed via native mod patches).
   2. Cross the checkpoint milestone to trigger Rally Point Bravo.
   3. Pick up the **Blind Skull** near the cliff.
   4. In The Ark or Crow's Nest, interact with a Forerunner terminal.
@@ -445,3 +447,81 @@ $env:SKIP_REQUIREMENTS_UPDATE="1"
      - *Expected*: Sends location check `117201` and confirms completion.
   3. Run `/complete Sierra 117 - Blind Skull` a second time.
      - *Expected*: Outputs `'Sierra 117 - Blind Skull' is already completed.` without resending network traffic.
+
+---
+
+#### TC-22: Campaign Submenu Direct-Skip, Mission Carousel Filtering & Multi-Game Stability
+* **Objective**: Verify that in-flight VFS PAK patches (`DT_MainMenuData`) skip intermediate submenus directly to Mission Select when selecting Halo 3, native Scaleform carousel interception (`UIWidgetArray::AddItem` at `+0x895F54`) dynamically omits locked mission cards, and multi-game campaign navigation remains stable.
+* **Steps**:
+  1. Launch MCC with native mod active and connect the client to a seed where only Sierra 117 is unlocked.
+  2. In the main menu, navigate to **Campaigns** -> **Halo 3**.
+  3. Notice that intermediate submenus (such as Playlists, Quickstart, or Built-In vs Mods) are automatically bypassed via in-flight PAK byte patching in `vfs_hooks.cpp` (`DirectMissions` and `FeatureID`), navigating straight to the Mission Select screen.
+  4. Observe the mission cards shown in the horizontal carousel: only unlocked missions (e.g. Sierra 117) are displayed; locked missions are dynamically dropped from the carousel array by `UIWidgetArray::AddItem`.
+  5. Unlock a new mission (e.g. `Crow's Nest`) via `/complete` or client cheat, re-open the mission carousel, and observe the new card seamlessly populate.
+  6. Return to the main menu, select **Campaign**, and click on another game (e.g. **Halo 2** or **Halo: Reach**) to verify vanilla campaigns load cleanly without crashing or freezing.
+* **Expected Result**:
+  - Selecting Halo 3 immediately opens the Mission Select carousel, skipping intermediate submenus.
+  - In step 4, only unlocked mission cards appear in the carousel.
+  - In step 5, newly unlocked mission cards populate dynamically.
+  - In step 6, clicking other campaigns passes cleanly through to vanilla MCC without freezing or crashing.
+  - Mod logs confirm:
+    ```
+    [VFS] >>> ReadFileSync: Reading DT_MainMenuData range!
+    [MissionFilter] AddItem hook active at ...
+    [MissionFilter] >>> DROPPING LOCKED MISSION CARD: idx=2 (020_base) <<<
+    ```
+
+---
+
+#### TC-23: Dynamic Pattern Scanning & Fallback Verification
+* **Objective**: Verify `%TEMP%\Halo3AP_mod.log` records dynamic pattern scan resolution for engine hooks and verified RVAs for `halo3.dll`.
+* **Steps**:
+  1. Check `%TEMP%\Halo3AP_mod.log` or debug output on game boot and during map loading.
+* **Expected Result**:
+  - Log records dynamic pattern resolution for Scaleform carousel interception:
+    - `[MissionFilter] AddItem hook active at ...` (or fallback `AddItem pattern not found, using RVA +0x895F54`)
+  - Lobby hooks (`Detour_CommitSelection`, `Detour_InitializeLevel`, `Detour_StartCountdown`) install cleanly.
+  - Engine hooks in `g_halo3Hooks` (`weapon_evaluate_candidate`, `can_trade_with_ally`, `Halo3EngineStep`, etc.) resolve via verified static RVAs or dynamic pattern scanning, confirmed by `[HOOK] Installed detour for ...`.
+
+---
+
+#### TC-24: Engine-Level ShellCommand Return-to-Menu
+* **Objective**: Verify mission win uses `IGameEngine::ShellCommand` to teardown the session without relying on fragile branch patches.
+* **Steps**:
+  1. Finish any campaign mission (or trigger `game_won`).
+  2. Monitor `%TEMP%\Halo3AP_mod.log`.
+* **Expected Result**:
+  - Log records:
+    - `[EVENT] game_won called! Mission complete!`
+    - `[ShellCommand] Intercepting command 0xD - sending clean teardown to menu...`
+  - Game transitions cleanly back to the Campaign mission select lobby without advancing to the next level in sequence.
+
+---
+
+#### TC-25: In-Game DeathLink Execution
+* **Objective**: Verify that incoming DeathLinks trigger the configured in-game penalty (`Kill`, `Shield Break`, `Mortal`).
+* **Steps**:
+  1. Launch MCC with native mod and connect client.
+  2. Start any campaign mission (e.g. Sierra 117) and wait for Master Chief to spawn with weapons equipped past the 180-tick grace period.
+  3. In client console, run `/deathlink test kill`. Observe Chief die and checkpoint reload without crashing or freezing.
+  4. Run `/deathlink test shield_break`. Observe shields instantly drop to 0% with EMP spark sound and shield bar fully depleting.
+  5. Run `/deathlink test mortal`. Observe shields drop to 0% and health bar drop to 10% red (one hit from death).
+* **Expected Result**:
+  - Each penalty executes smoothly during active gameplay.
+  - Mod logs penalty execution: `[DeathLink] EXECUTING <KILL/SHIELD BREAK/MORTAL DAMAGE>...`.
+
+---
+
+#### TC-26: Feedback Loop Suppression & Amnesty
+* **Objective**: Verify incoming kills do not echo back outward, and amnesty absorbs deaths.
+* **Steps**:
+  1. Generate or configure a YAML profile with `death_link: true` and `death_link_amnesty: 2`.
+  2. Connect to the multiworld room.
+  3. Die naturally in-game twice.
+  4. Die a third time naturally in-game.
+  5. Receive an incoming DeathLink kill (or run `/deathlink test kill`).
+* **Expected Result**:
+  - On first two deaths, client log shows: `[DeathLink] Local death absorbed by amnesty (1/2)` and `(2/2)`. No DeathLink is broadcast to multiworld.
+  - On third death, client broadcasts `DeathLink` to the multiworld room: `[DeathLink] Amnesty exhausted! Sending death to multiworld: ...`.
+  - When dying due to an incoming DeathLink kill, neither the native mod nor the client re-broadcasts the death outward (no feedback loop). Mod log confirms `s_wasChiefAlive = false` debounce and client suppresses with `is_penalty_death_pending`.
+

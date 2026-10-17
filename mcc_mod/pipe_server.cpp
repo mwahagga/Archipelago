@@ -7,6 +7,8 @@
 namespace Halo3AP {
 
 ModState g_modState;
+std::atomic<float> g_maxShieldFraction(1.0f);
+std::atomic<int> g_pendingDeathLinkEffect(0); // 0=None, 1=Kill, 2=ShieldBreak, 3=Mortal
 
 static std::mutex g_logMtx;
 
@@ -117,6 +119,43 @@ void ParseStateJson(const std::string& json) {
             }
         }
     }
+
+    // 5. Max Shield Fraction
+    size_t shieldPos = json.find("\"max_shield_fraction\"");
+    if (shieldPos != std::string::npos) {
+        size_t colon = json.find(':', shieldPos);
+        if (colon != std::string::npos) {
+            float newShield = std::strtof(json.c_str() + colon + 1, nullptr);
+            if (newShield >= 0.0f) {
+                float oldShield = g_maxShieldFraction.exchange(newShield);
+                if (std::abs(oldShield - newShield) > 0.001f) {
+                    Log("[Halo3AP Mod] Updated max shield fraction: %.2f (%.0f%%)", newShield, newShield * 100.0f);
+                }
+            }
+        }
+    }
+
+    // 6. DeathLink Pending Effect
+    size_t dlPos = json.find("\"deathlink_pending\"");
+    if (dlPos != std::string::npos) {
+        size_t firstQuote = json.find('"', dlPos + 19);
+        if (firstQuote != std::string::npos) {
+            size_t secondQuote = json.find('"', firstQuote + 1);
+            if (secondQuote != std::string::npos) {
+                std::string effect = json.substr(firstQuote + 1, secondQuote - firstQuote - 1);
+                if (effect == "kill") {
+                    g_pendingDeathLinkEffect.store(1);
+                    Log("[DeathLink] Queued pending effect: KILL");
+                } else if (effect == "shield_break") {
+                    g_pendingDeathLinkEffect.store(2);
+                    Log("[DeathLink] Queued pending effect: SHIELD_BREAK");
+                } else if (effect == "mortal") {
+                    g_pendingDeathLinkEffect.store(3);
+                    Log("[DeathLink] Queued pending effect: MORTAL");
+                }
+            }
+        }
+    }
 }
 
 
@@ -159,11 +198,24 @@ static const MissionMapping G_MISSIONS[] = {
     {"120_halo", "Halo"},
 };
 
+bool IsClientConnected() {
+    std::lock_guard<std::mutex> lock(g_modState.mtx);
+    return g_modState.pipeConnected || g_modState.tcpConnected;
+}
+
+bool HasHalo3Unlocked() {
+    std::lock_guard<std::mutex> lock(g_modState.mtx);
+    return (g_modState.pipeConnected || g_modState.tcpConnected) && !g_modState.unlockedMissions.empty();
+}
+
 bool IsMissionUnlocked(const std::string& scenario) {
     std::lock_guard<std::mutex> lock(g_modState.mtx);
-    // If no client is connected yet or missions haven't been pushed, allow default Sierra 117
+    // Disconnected players cannot play anything
+    if (!g_modState.pipeConnected && !g_modState.tcpConnected) {
+        return false;
+    }
     if (g_modState.unlockedMissions.empty()) {
-        return (scenario.find("010_jungle") != std::string::npos || scenario.find("Sierra 117") != std::string::npos);
+        return false;
     }
 
     // Find corresponding friendly name
@@ -260,7 +312,7 @@ DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             Log("[Halo3AP Mod] Client connected to Named Pipe!");
             {
                 std::lock_guard<std::mutex> lock(g_modState.mtx);
-                g_modState.clientConnected = true;
+                g_modState.pipeConnected = true;
             }
 
             // Send handshake
@@ -281,9 +333,14 @@ DWORD WINAPI PipeServerThread(LPVOID lpParam) {
             }
 
             Log("[Halo3AP Mod] Client disconnected from Named Pipe.");
+            bool stillConnected = false;
             {
                 std::lock_guard<std::mutex> lock(g_modState.mtx);
-                g_modState.clientConnected = false;
+                g_modState.pipeConnected = false;
+                stillConnected = g_modState.tcpConnected;
+                if (!stillConnected) {
+                    g_modState.unlockedMissions.clear();
+                }
             }
         }
 
@@ -344,7 +401,7 @@ DWORD WINAPI TcpServerThread(LPVOID lpParam) {
         Log("[Halo3AP Mod] Client connected to TCP IPC Server!");
         {
             std::lock_guard<std::mutex> lock(g_modState.mtx);
-            g_modState.clientConnected = true;
+            g_modState.tcpConnected = true;
         }
 
         // Send handshake
@@ -373,9 +430,14 @@ DWORD WINAPI TcpServerThread(LPVOID lpParam) {
         }
 
         Log("[Halo3AP Mod] Client disconnected from TCP IPC.");
+        bool stillConnected = false;
         {
             std::lock_guard<std::mutex> lock(g_modState.mtx);
-            g_modState.clientConnected = false;
+            g_modState.tcpConnected = false;
+            stillConnected = g_modState.pipeConnected;
+            if (!stillConnected) {
+                g_modState.unlockedMissions.clear();
+            }
         }
         closesocket(clientSock);
     }

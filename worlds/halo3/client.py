@@ -4,11 +4,19 @@ import asyncio
 import atexit
 import json
 import os
+import random
 import sys
+import threading
+import time
 import typing
 
 import Utils
 from Utils import async_start
+import logging
+
+# Silence low-level websocket ping/pong keepalive frames and raw text frame debugging
+logging.getLogger("websockets").setLevel(logging.WARNING)
+logging.getLogger("websockets.client").setLevel(logging.WARNING)
 
 if __name__ == "__main__":
     import ModuleUpdate
@@ -184,8 +192,63 @@ class Halo3CommandProcessor(ClientCommandProcessor):
             self.output(f"Mod DLL Installed in MCC: {'YES' if installed else 'NO'} ({dxgi_file})")
         bundled = get_bundled_dxgi_path()
         self.output(f"Bundled Mod DLL Available: {'YES' if os.path.isfile(bundled) else 'NO'} ({bundled})")
+        shield_pct = int(self.ctx.get_max_shield_fraction() * 100)
+        self.output(f"MJOLNIR Shield Capacity: {shield_pct}% (Mode {self.ctx.shield_progression}, Upgrades: {self.ctx.shield_upgrade_count})")
         self.output("Watchdog Supervisor: worlds/halo3/cleanup.py")
         self.output("--------------------------------")
+
+    def _cmd_deathlink(self, *args: str) -> None:
+        """Configure, test, or check DeathLink status.
+        Usage:
+            /deathlink [on|off]
+            /deathlink effect [kill|shield_break|mortal]
+            /deathlink test [kill|shield_break|mortal]
+        """
+        subcmd = args[0].lower() if args else ""
+        if subcmd in ("1", "true", "on"):
+            self.ctx.death_link = True
+            self.ctx.dispatch_async(self.ctx.update_death_link(True))
+            self.output("DeathLink is now ENABLED.")
+        elif subcmd in ("0", "false", "off"):
+            self.ctx.death_link = False
+            self.ctx.dispatch_async(self.ctx.update_death_link(False))
+            self.output("DeathLink is now DISABLED.")
+        elif subcmd == "effect" and len(args) > 1:
+            eff = args[1].lower()
+            eff_map = {"kill": 0, "shield_break": 1, "shield": 1, "mortal": 2}
+            if eff in eff_map:
+                self.ctx.death_link_effect = eff_map[eff]
+                name = {0: "Kill", 1: "Shield Break", 2: "Mortal"}[eff_map[eff]]
+                self.output(f"DeathLink effect set to: {name}")
+            else:
+                self.output("Unknown effect. Valid options: kill, shield_break, mortal")
+        elif subcmd == "test":
+            eff = args[1].lower() if len(args) > 1 else None
+            eff_map = {"kill": 0, "shield_break": 1, "shield": 1, "mortal": 2}
+            saved_eff = self.ctx.death_link_effect
+            if eff and eff in eff_map:
+                self.ctx.death_link_effect = eff_map[eff]
+            eff_name = {0: "Kill", 1: "Shield Break", 2: "Mortal"}[self.ctx.death_link_effect]
+            self.output(f"Triggering simulated DeathLink test (effect: {eff_name})...")
+            # Temporarily ensure death_link is on for test
+            was_enabled = self.ctx.death_link
+            self.ctx.death_link = True
+            self.ctx.received_deaths_count = self.ctx.death_link_receive_hits - 1
+            self.ctx.death_link_cooldown = 0.0
+            self.ctx.on_deathlink({"time": time.time(), "source": "TestRunner", "cause": "Simulated DeathLink test"})
+            self.ctx.death_link_effect = saved_eff
+            self.ctx.death_link = was_enabled
+        else:
+            status = "ENABLED" if self.ctx.death_link else "DISABLED"
+            effect_names = {0: "Kill", 1: "Shield Break", 2: "Mortal"}
+            effect = effect_names.get(self.ctx.death_link_effect, "Kill")
+            self.output(
+                f"DeathLink is currently {status}. "
+                f"(Amnesty: {self.ctx.death_link_amnesty}, "
+                f"Receive Hits: {self.ctx.death_link_receive_hits}, "
+                f"Effect: {effect})\n"
+                f"Subcommands: /deathlink on | off | effect <kill|shield_break|mortal> | test [effect]"
+            )
 
 
 
@@ -195,6 +258,11 @@ class Halo3Context(CommonContext):
     command_processor = Halo3CommandProcessor
     game = "Halo 3"
     items_handling = 0b111  # receive all items
+    ipc_lock: threading.Lock = threading.Lock()
+    state_dirty: bool = False
+    pending_mod_deathlink: str | None = None
+    is_penalty_death_pending: bool = False
+    penalty_death_expires: float = 0.0
 
     def __init__(self, server_address: str, password: str | None) -> None:
         super().__init__(server_address, password)
@@ -203,6 +271,9 @@ class Halo3Context(CommonContext):
         self.weapon_license_mode: int = 1
         self.starting_weapon: str = "Assault Rifle"
         self.goal: int = 0
+        self.missions_required: int = 5
+        self.shield_progression: int = 0
+        self.shield_upgrade_count: int = 0
         self.finished_game: bool = False
         self.mcc_connected: bool = False
         self.current_mcc_map: str | None = None
@@ -215,6 +286,26 @@ class Halo3Context(CommonContext):
         self.tcp_sock: typing.Any = None
         self.ipc_connected: bool = False
         self.ipc_type: str = "none"
+        self.ipc_lock: threading.Lock = threading.Lock()
+        self.state_dirty: bool = False
+
+        # DeathLink state
+        self.death_link: bool = False
+        self.death_link_amnesty: int = 0
+        self.death_link_receive_hits: int = 1
+        self.death_link_effect: int = 0  # 0: kill, 1: shield_break, 2: mortal
+        self.local_deaths_count: int = 0
+        self.received_deaths_count: int = 0
+        self.death_link_cooldown: float = 0.0
+        self.pending_mod_deathlink: str | None = None
+        self.is_penalty_death_pending: bool = False
+        self.penalty_death_expires: float = 0.0
+
+        # Event loop reference for thread-safe scheduling from worker threads
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = None
 
         # State bridge directory (cross-platform)
         if sys.platform == "win32":
@@ -225,6 +316,17 @@ class Halo3Context(CommonContext):
         self.state_file = os.path.join(self.state_dir, "state.json")
         self.write_state_file()
 
+    def dispatch_async(self, coro: typing.Coroutine) -> None:
+        """Schedule a coroutine on the main asyncio event loop, safely callable from worker threads."""
+        try:
+            asyncio.get_running_loop()
+            async_start(coro)
+        except RuntimeError:
+            if hasattr(self, "loop") and self.loop and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(coro, self.loop)
+            else:
+                async_start(coro)
+
     async def server_auth(self, password_requested: bool = False):
         if password_requested and not self.password:
             await super().server_auth(password_requested)
@@ -232,130 +334,154 @@ class Halo3Context(CommonContext):
         await self.send_connect()
 
     def connect_ipc(self) -> bool:
-        """Connect to the native mod IPC server via TCP socket or Windows Named Pipe."""
-        if self.ipc_connected and (self.tcp_sock is not None or self.pipe_handle is not None):
-            return True
+        """Connect to the native mod IPC server via Windows Named Pipe or TCP socket."""
+        with self.ipc_lock:
+            if self.ipc_connected and (self.tcp_sock is not None or self.pipe_handle is not None):
+                return True
 
-        # 1. Try Localhost TCP Socket (Universal across Windows, Linux, and Steam Deck)
-        try:
-            import socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.5)
-            sock.connect((DEFAULT_TCP_HOST, DEFAULT_TCP_PORT))
-            sock.settimeout(2.0)
-            self.tcp_sock = sock
-            self.ipc_connected = True
-            self.ipc_type = "tcp"
-            try:
-                greeting = self.tcp_sock.recv(4096).decode(errors="ignore").strip()
-                logger.info(f"[IPC] Connected to native mod via TCP: {greeting}")
-            except Exception:
-                logger.info("[IPC] Connected to native mod via TCP")
-            return True
-        except Exception:
-            self.tcp_sock = None
-
-        # 2. Fallback: Named Pipe on Windows
-        if sys.platform == "win32":
-            try:
-                import win32file
-                self.pipe_handle = win32file.CreateFile(
-                    PIPE_NAME,
-                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                    0,
-                    None,
-                    win32file.OPEN_EXISTING,
-                    0,
-                    None,
-                )
-                self.ipc_connected = True
-                self.ipc_type = "pipe"
+            # 1. On Windows, try Named Pipe FIRST (instant non-blocking check, <0.05ms)
+            if sys.platform == "win32":
                 try:
-                    _, data = win32file.ReadFile(self.pipe_handle, 4096)
-                    greeting = data.decode(errors="ignore").strip()
-                    logger.info(f"[IPC] Connected to native mod via Named Pipe: {greeting}")
+                    import win32file
+                    self.pipe_handle = win32file.CreateFile(
+                        PIPE_NAME,
+                        win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                        0,
+                        None,
+                        win32file.OPEN_EXISTING,
+                        0,
+                        None,
+                    )
+                    self.ipc_connected = True
+                    self.ipc_type = "pipe"
+                    try:
+                        _, data = win32file.ReadFile(self.pipe_handle, 4096)
+                        greeting = data.decode(errors="ignore").strip()
+                        logger.info(f"[IPC] Connected to native mod via Named Pipe: {greeting}")
+                    except Exception:
+                        logger.info("[IPC] Connected to native mod via Named Pipe")
+                    return True
                 except Exception:
-                    logger.info("[IPC] Connected to native mod via Named Pipe")
+                    self.pipe_handle = None
+
+            # 2. Localhost TCP Socket (Linux/Steam Deck Proton or fallback)
+            try:
+                import socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.05)  # 50ms fast timeout to avoid UI freezes
+                sock.connect((DEFAULT_TCP_HOST, DEFAULT_TCP_PORT))
+                sock.settimeout(2.0)
+                self.tcp_sock = sock
+                self.ipc_connected = True
+                self.ipc_type = "tcp"
+                try:
+                    greeting = self.tcp_sock.recv(4096).decode(errors="ignore").strip()
+                    logger.info(f"[IPC] Connected to native mod via TCP: {greeting}")
+                except Exception:
+                    logger.info("[IPC] Connected to native mod via TCP")
                 return True
             except Exception:
-                self.pipe_handle = None
+                self.tcp_sock = None
 
-        self.ipc_connected = False
-        self.ipc_type = "none"
-        return False
+            self.ipc_connected = False
+            self.ipc_type = "none"
+            return False
 
     connect_pipe = connect_ipc  # Backwards compatibility alias
 
     def disconnect_ipc(self) -> None:
-        self.ipc_connected = False
-        self.ipc_type = "none"
-        if self.tcp_sock is not None:
-            try:
-                self.tcp_sock.close()
-            except Exception:
-                pass
-            self.tcp_sock = None
-        if self.pipe_handle is not None:
-            try:
-                import win32file
-                win32file.CloseHandle(self.pipe_handle)
-            except Exception:
-                pass
-            self.pipe_handle = None
+        with self.ipc_lock:
+            self.ipc_connected = False
+            self.ipc_type = "none"
+            if self.tcp_sock is not None:
+                try:
+                    self.tcp_sock.close()
+                except Exception:
+                    pass
+                self.tcp_sock = None
+            if self.pipe_handle is not None:
+                try:
+                    import win32file
+                    win32file.CloseHandle(self.pipe_handle)
+                except Exception:
+                    pass
+                self.pipe_handle = None
 
-    def push_state_to_mod(self) -> None:
+    def push_state_to_mod(self) -> list[str]:
         """Push current unlock state to the native mod via TCP socket or Named Pipe."""
-        if not self.ipc_connected:
-            return
-        state = {
-            "unlocked_missions": list(self.unlocked_missions),
-            "unlocked_weapons": list(self.unlocked_weapons),
-            "weapon_license_mode": self.weapon_license_mode,
-            "starting_weapon": self.starting_weapon,
-        }
-        payload = (json.dumps(state) + "\n").encode("utf-8")
-        ack_str = None
-        try:
-            if self.ipc_type == "tcp" and self.tcp_sock is not None:
-                self.tcp_sock.sendall(payload)
-                ack_data = self.tcp_sock.recv(4096)
-                if not ack_data:
-                    raise ConnectionResetError("TCP socket closed by remote")
-                ack_str = ack_data.decode(errors="ignore").strip()
-            elif self.ipc_type == "pipe" and self.pipe_handle is not None:
-                import win32file
-                win32file.WriteFile(self.pipe_handle, payload)
-                _, ack_data = win32file.ReadFile(self.pipe_handle, 4096)
-                ack_str = ack_data.decode(errors="ignore").strip()
-        except Exception as e:
-            logger.debug(f"[IPC] State push failed: {e}")
-            self.disconnect_ipc()
-            return
-
-        if ack_str:
+        with self.ipc_lock:
+            if not self.ipc_connected:
+                return []
+            state = {
+                "unlocked_missions": list(self.unlocked_missions),
+                "unlocked_weapons": list(self.unlocked_weapons),
+                "weapon_license_mode": self.weapon_license_mode,
+                "starting_weapon": self.starting_weapon,
+                "max_shield_fraction": self.get_max_shield_fraction(),
+            }
+            sending_deathlink = self.pending_mod_deathlink
+            if sending_deathlink:
+                state["deathlink_pending"] = sending_deathlink
+            payload = (json.dumps(state) + "\n").encode("utf-8")
+            ack_str = None
             try:
-                sanitized_ack = ack_str.replace('\\', '/')
-                ack_json = json.loads(sanitized_ack)
+                if self.ipc_type == "tcp" and self.tcp_sock is not None:
+                    self.tcp_sock.sendall(payload)
+                    ack_data = self.tcp_sock.recv(4096)
+                    if not ack_data:
+                        raise ConnectionResetError("TCP socket closed by remote")
+                    ack_str = ack_data.decode(errors="ignore").strip()
+                elif self.ipc_type == "pipe" and self.pipe_handle is not None:
+                    import win32file
+                    win32file.WriteFile(self.pipe_handle, payload)
+                    _, ack_data = win32file.ReadFile(self.pipe_handle, 4096)
+                    ack_str = ack_data.decode(errors="ignore").strip()
+            except Exception as e:
+                logger.debug(f"[IPC] State push failed: {e}")
+                self.disconnect_ipc()
+                return []
 
-                # Check if mod reported current map
-                mod_map = ack_json.get("current_map")
-                if mod_map:
-                    detected_name = None
-                    for code, name in SCENARIO_MAP.items():
-                        if code in mod_map:
-                            detected_name = name
-                            break
-                    if detected_name and self.current_mcc_map != detected_name:
-                        self.prev_mcc_map = self.current_mcc_map
-                        self.current_mcc_map = detected_name
-                        logger.info(f"[MCC Mod Sync] Active Level: {detected_name}")
+            # Only clear the pending deathlink if this send succeeded
+            if sending_deathlink and self.pending_mod_deathlink == sending_deathlink:
+                self.pending_mod_deathlink = None
+            self.state_dirty = False
 
-                events = ack_json.get("events", [])
-                if events:
-                    logger.debug(f"[IPC] Mod response with events: {ack_str}")
-                    self.process_mod_events(events)
-            except json.JSONDecodeError as err:
-                logger.error(f"[IPC] Failed to parse JSON response from mod: {err} (raw: {ack_str})")
+            if ack_str:
+                try:
+                    sanitized_ack = ack_str.replace('\\', '/')
+                    ack_json = json.loads(sanitized_ack)
+
+                    # Check if mod reported current map
+                    mod_map = ack_json.get("current_map")
+                    if mod_map:
+                        detected_name = None
+                        for code, name in SCENARIO_MAP.items():
+                            if code in mod_map:
+                                detected_name = name
+                                break
+                        if detected_name and self.current_mcc_map != detected_name:
+                            self.prev_mcc_map = self.current_mcc_map
+                            self.current_mcc_map = detected_name
+                            logger.info(f"[MCC Mod Sync] Active Level: {detected_name}")
+
+                    events = ack_json.get("events", [])
+                    if events:
+                        logger.debug(f"[IPC] Mod response with events: {ack_str}")
+                        if hasattr(self, "loop") and self.loop and self.loop.is_running():
+                            try:
+                                running_loop = asyncio.get_running_loop()
+                            except RuntimeError:
+                                running_loop = None
+                            if running_loop == self.loop:
+                                self.process_mod_events(events)
+                            else:
+                                self.loop.call_soon_threadsafe(self.process_mod_events, events)
+                        else:
+                            self.process_mod_events(events)
+                        return events
+                except json.JSONDecodeError as err:
+                    logger.error(f"[IPC] Failed to parse JSON response from mod: {err} (raw: {ack_str})")
+            return []
 
     def process_mod_events(self, events: list[str]) -> None:
         """Process events detected by the native mod (rally points, terminals, skulls, mission completion).
@@ -379,6 +505,8 @@ class Halo3Context(CommonContext):
                 self._handle_terminal_event(event)
             elif event.startswith("skull_"):
                 self._handle_skull_event(event)
+            elif event == "player_death":
+                self._handle_player_death_event()
             else:
                 logger.warning(f"[Mod Event] Unknown event type: {event}")
 
@@ -598,13 +726,95 @@ class Halo3Context(CommonContext):
         else:
             logger.warning(f"[Game Won] No location mapping for mission: {target_map}")
 
+    def _handle_player_death_event(self) -> None:
+        """Handle player death detected by the native mod."""
+        if not self.death_link:
+            return
+
+        now = time.time()
+
+        # If this death was caused by an incoming penalty, suppress outward broadcast!
+        if getattr(self, "is_penalty_death_pending", False) and now < getattr(self, "penalty_death_expires", 0.0):
+            self.is_penalty_death_pending = False
+            self.death_link_cooldown = now + 10.0
+            logger.info("[DeathLink] Local death suppressed from broadcast (caused by incoming DeathLink penalty).")
+            return
+        self.is_penalty_death_pending = False
+
+        if not self.current_mcc_map:
+            logger.debug("[DeathLink] Local death ignored (not in active mission).")
+            return
+
+        if now < self.death_link_cooldown:
+            logger.debug("[DeathLink] Local death ignored (cooldown).")
+            return
+
+        self.local_deaths_count += 1
+        if self.local_deaths_count <= self.death_link_amnesty:
+            logger.info(
+                f"[DeathLink] Local death absorbed by amnesty ({self.local_deaths_count}/{self.death_link_amnesty})."
+            )
+            return
+
+        self.local_deaths_count = 0
+        self.death_link_cooldown = now + 4.0
+
+        player_name = self.player_names.get(self.slot, "Master Chief") if self.slot is not None else "Master Chief"
+        death_causes = [
+            f"{player_name} was killed in combat.",
+            f"{player_name} caught a plasma grenade.",
+            f"{player_name} was glassed.",
+            f"{player_name} was overwhelmed by the Covenant.",
+            f"{player_name} succumbed to the Flood.",
+            f"{player_name} miscalculated the grenade jump.",
+            f"{player_name}'s shields gave out.",
+        ]
+        cause = random.choice(death_causes)
+        logger.warning(f"[DeathLink] >> BROADCASTING DEATH: {cause} <<")
+        self.dispatch_async(self.send_death(cause))
+
+    def on_deathlink(self, data: dict[str, typing.Any]) -> None:
+        super().on_deathlink(data)
+        if not self.death_link:
+            return
+
+        now = time.time()
+        if now < self.death_link_cooldown:
+            logger.info("[DeathLink] Ignored incoming deathlink (within cooldown).")
+            return
+
+        self.received_deaths_count += 1
+        source = data.get("source", "another player")
+        cause = data.get("cause", "")
+        detail = f": {cause}" if cause else ""
+        logger.info(
+            f"[DeathLink] Received hit {self.received_deaths_count}/{self.death_link_receive_hits} from {source}{detail}"
+        )
+
+        if self.received_deaths_count >= self.death_link_receive_hits:
+            self.received_deaths_count = 0
+            self.death_link_cooldown = now + 15.0  # Cooldown to suppress feedback loop
+
+            effect_names = {0: "kill", 1: "shield_break", 2: "mortal"}
+            effect_str = effect_names.get(self.death_link_effect, "kill")
+            if effect_str == "kill":
+                self.is_penalty_death_pending = True
+                self.penalty_death_expires = now + 15.0
+            logger.warning(f"[DeathLink] >> Executing penalty: {effect_str.upper()}! <<")
+            self.pending_mod_deathlink = effect_str
+            self.write_state_file()
+
     def check_goal_condition(self, loc_id: int | None = None) -> None:
+        def _send_status(status: ClientStatus):
+            msg = [{"cmd": "StatusUpdate", "status": status}]
+            self.dispatch_async(self.send_msgs(msg))
+
         if not self.finished_game:
             if self.goal == 0:  # Beat Halo
                 halo_id = LOCATION_NAME_TO_ID.get("Halo - Mission Complete")
                 if loc_id == halo_id or (halo_id and halo_id in self.checked_locations):
                     logger.info("[AP] Victory condition met! Completed Halo!")
-                    async_start(self.send_msgs([{"cmd": "StatusUpdate", "status": ClientStatus.CLIENT_GOAL}]))
+                    _send_status(ClientStatus.CLIENT_GOAL)
                     self.finished_game = True
             elif self.goal == 1:  # Beat All Missions
                 all_mission_loc_ids = {
@@ -612,14 +822,65 @@ class Halo3Context(CommonContext):
                 }
                 if all_mission_loc_ids.issubset(self.checked_locations):
                     logger.info("[AP] Victory condition met! All 9 missions completed!")
-                    async_start(self.send_msgs([{"cmd": "StatusUpdate", "status": ClientStatus.CLIENT_GOAL}]))
+                    _send_status(ClientStatus.CLIENT_GOAL)
+                    self.finished_game = True
+            elif self.goal == 2:  # Fast Victory (Any X Unique Missions)
+                all_mission_loc_ids = {
+                    LOCATION_NAME_TO_ID[f"{m} - Mission Complete"] for m in MISSION_NAMES
+                }
+                completed_unique = all_mission_loc_ids.intersection(self.checked_locations)
+                if len(completed_unique) >= self.missions_required:
+                    logger.info(
+                        f"[AP] Victory condition met! Completed {len(completed_unique)}/{self.missions_required} unique missions!"
+                    )
+                    _send_status(ClientStatus.CLIENT_GOAL)
                     self.finished_game = True
 
-    def write_state_file(self) -> None:
+    def get_max_shield_fraction(self) -> float:
+        """Calculate Chief's current maximum shield capacity fraction based on
+        shield_progression option and collected Progressive Shield Upgrades.
+        Each upgrade increases shield capacity by +25%.
+        """
+        mode = getattr(self, "shield_progression", 0)
+        upgrades = getattr(self, "shield_upgrade_count", 0)
+
+        # 0: Vanilla (100% full shield)
+        if mode == 0:
+            return 1.0
+
+        # 1: Progressive (starts at 25%, 3 upgrades to 100%)
+        elif mode == 1:
+            levels = [0.25, 0.50, 0.75, 1.00]
+            idx = min(upgrades, len(levels) - 1)
+            return levels[idx]
+
+        # 2: Progressive + Overshield (starts at 25%, 7 upgrades to 300% / Triple Overshield)
+        elif mode == 2:
+            levels = [0.25, 0.50, 0.75, 1.00, 1.50, 2.00, 2.50, 3.00]
+            idx = min(upgrades, len(levels) - 1)
+            return levels[idx]
+
+        # 3: Glass Cannon (starts at 0%, 4 upgrades to 100%)
+        elif mode == 3:
+            levels = [0.00, 0.25, 0.50, 0.75, 1.00]
+            idx = min(upgrades, len(levels) - 1)
+            return levels[idx]
+
+        # 4: Glass Cannon + Overshield (starts at 0%, 8 upgrades to 300% / Triple Overshield)
+        elif mode == 4:
+            levels = [0.00, 0.25, 0.50, 0.75, 1.00, 1.50, 2.00, 2.50, 3.00]
+            idx = min(upgrades, len(levels) - 1)
+            return levels[idx]
+
+        return 1.0
+
+    def write_state_file(self, push_to_mod: bool = True) -> None:
         data = {
             "unlocked_missions": list(self.unlocked_missions),
             "unlocked_weapons": list(self.unlocked_weapons),
             "checked_locations": list(self.checked_locations),
+            "shield_upgrade_count": self.shield_upgrade_count,
+            "max_shield_fraction": self.get_max_shield_fraction(),
             "mcc_connected": self.mcc_connected,
             "current_map": self.current_mcc_map,
         }
@@ -628,8 +889,9 @@ class Halo3Context(CommonContext):
                 json.dump(data, f, indent=2)
         except Exception as e:
             logger.debug(f"Failed to write state file: {e}")
-        # Also push to native mod via pipe
-        self.push_state_to_mod()
+        # Mark state dirty so mcc_watcher pushes it asynchronously without blocking the event loop
+        if push_to_mod:
+            self.state_dirty = True
 
     def on_package(self, cmd: str, args: dict[str, typing.Any]) -> None:
         if cmd == "Connected":
@@ -638,6 +900,21 @@ class Halo3Context(CommonContext):
             self.weapon_license_mode = slot_data.get("weapon_license_mode", 1)
             self.starting_weapon = slot_data.get("starting_weapon", "assault_rifle")
             self.goal = slot_data.get("goal", 0)
+            self.missions_required = slot_data.get("missions_required", 5)
+            self.shield_progression = slot_data.get("shield_progression", 0)
+            self.death_link = bool(slot_data.get("death_link", False))
+            self.death_link_amnesty = slot_data.get("death_link_amnesty", 0)
+            self.death_link_receive_hits = slot_data.get("death_link_receive_hits", 1)
+            self.death_link_effect = slot_data.get("death_link_effect", 0)
+
+            if self.death_link:
+                self.dispatch_async(self.update_death_link(True))
+                effect_names = {0: "Kill", 1: "Shield Break", 2: "Mortal"}
+                logger.info(
+                    f"[DeathLink] Enabled! (Amnesty: {self.death_link_amnesty}, "
+                    f"Receive Hits: {self.death_link_receive_hits}, "
+                    f"Effect: {effect_names.get(self.death_link_effect, 'Kill')})"
+                )
 
             # Reconcile checked locations from server on reconnect
             server_checked = args.get("checked_locations", [])
@@ -649,6 +926,9 @@ class Halo3Context(CommonContext):
             self.write_state_file()
 
         elif cmd == "ReceivedItems":
+            if args.get("index", 0) == 0:
+                self.shield_upgrade_count = 0
+
             for item in args.get("items", []):
                 net_item = NetworkItem(*item)
                 item_name = self.item_names.lookup_in_slot(net_item.item, self.slot)
@@ -669,6 +949,12 @@ class Halo3Context(CommonContext):
                         if norm_name not in self.unlocked_weapons:
                             self.unlocked_weapons.add(norm_name)
                             logger.info(f"[AP] >> UNLOCKED WEAPON: {norm_name}! <<")
+                elif item_name == "Progressive Shield Upgrade":
+                    self.shield_upgrade_count += 1
+                    logger.info(
+                        f"[AP] >> MJOLNIR SHIELD UPGRADE #{self.shield_upgrade_count} RECEIVED! "
+                        f"Capacity: {int(self.get_max_shield_fraction() * 100)}%! <<"
+                    )
             self.write_state_file()
 
         elif cmd == "RoomUpdate":
@@ -677,9 +963,10 @@ class Halo3Context(CommonContext):
 
     def send_location_check(self, loc_id: int, check_name: str) -> None:
         self.checked_locations.add(loc_id)
-        async_start(self.send_msgs([{"cmd": "LocationChecks", "locations": [loc_id]}]))
+        msg = [{"cmd": "LocationChecks", "locations": [loc_id]}]
+        self.dispatch_async(self.send_msgs(msg))
         logger.info(f"[AP] Completed check: {check_name}")
-        self.write_state_file()
+        self.write_state_file(push_to_mod=False)
 
         # Check goal condition
         self.check_goal_condition(loc_id)
@@ -751,15 +1038,16 @@ async def mcc_watcher(ctx: Halo3Context) -> None:
             except Exception as e:
                 logger.debug(f"Error handling trigger file: {e}")
 
-        # Check MCC IPC connection (TCP socket or pipe)
+        # Check MCC IPC connection (Named Pipe or TCP socket)
         if not ctx.ipc_connected:
-            if ctx.connect_ipc():
+            connected = await asyncio.to_thread(ctx.connect_ipc)
+            if connected:
                 ctx.mcc_connected = True
-                ctx.push_state_to_mod()
+                await asyncio.to_thread(ctx.push_state_to_mod)
             elif not ctx.mcc_connected:
-                ctx.try_connect_mcc()
+                await asyncio.to_thread(ctx.try_connect_mcc)
         else:
-            ctx.push_state_to_mod()
+            await asyncio.to_thread(ctx.push_state_to_mod)
 
         if ctx.mcc_connected and ctx.pm is not None:
             # Check if process is still alive and read live status
@@ -806,6 +1094,10 @@ async def mcc_watcher(ctx: Halo3Context) -> None:
                                 # Log if player is on a locked level (native mod handles actual gating)
                                 if ctx.unlocked_missions and detected_map not in ctx.unlocked_missions:
                                     logger.warning(f"[AP] Note: '{detected_map}' is not unlocked (native mod should gate this)")
+                            elif not detected_map and ctx.current_mcc_map is not None:
+                                logger.info(f"[MCC Auto-Detect] Returned to menu from {ctx.current_mcc_map}")
+                                ctx.current_mcc_map = None
+                                ctx.write_state_file()
                     except Exception:
                         pass
 
@@ -833,7 +1125,9 @@ async def mcc_watcher(ctx: Halo3Context) -> None:
                 ctx.halo3_module_base = None
                 logger.info("Lost connection to MCC-Win64-Shipping.exe.")
 
-        await asyncio.sleep(0.5)
+        # Polling rate: 0.3s when connected for responsive sync, 1.0s when disconnected
+        poll_interval = 0.3 if ctx.mcc_connected else 1.0
+        await asyncio.sleep(poll_interval)
 
 
 async def main(args: argparse.Namespace) -> None:
@@ -899,6 +1193,9 @@ def parse_args(argv: typing.Sequence[str] | None = None) -> argparse.Namespace:
 def launch(*launch_args: str) -> None:
     """Synchronous launcher entry point compatible with LauncherComponents and CLI."""
     import colorama
+    Utils.init_logging("Halo3Client", exception_logger="Client")
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("websockets.client").setLevel(logging.WARNING)
     atexit.register(cleanup_mod)
     args = parse_args(launch_args if launch_args else None)
     colorama.init()

@@ -9,6 +9,7 @@
 #include <vector>
 #include <set>
 #include <mutex>
+#include <atomic>
 
 namespace Halo3AP {
 
@@ -18,7 +19,8 @@ struct ModState {
     std::set<std::string> unlockedWeapons;
     int weaponLicenseMode = 1; // 0 = disabled, 1 = individual, 2 = tiers
     std::string startingWeapon = "assault_rifle";
-    bool clientConnected = false;
+    bool pipeConnected = false;
+    bool tcpConnected = false;
     std::string lastBlockedMission = "";
 
     // Events detected by in-game hooks (rally points, terminals, skulls).
@@ -27,12 +29,20 @@ struct ModState {
 };
 
 extern ModState g_modState;
+extern std::atomic<float> g_maxShieldFraction;
+extern std::atomic<int> g_pendingDeathLinkEffect; // 0=None, 1=Kill, 2=ShieldBreak, 3=Mortal
 
 // Thread entry point for the Named Pipe IPC server (Windows)
 DWORD WINAPI PipeServerThread(LPVOID lpParam);
 
 // Thread entry point for the Localhost TCP IPC server (Universal Windows / Linux Proton)
 DWORD WINAPI TcpServerThread(LPVOID lpParam);
+
+// Helper function to check if an Archipelago client is currently connected
+bool IsClientConnected();
+
+// Helper function to check if the player has at least one Halo 3 level unlocked
+bool HasHalo3Unlocked();
 
 // Helper function to check if a scenario is allowed to load
 bool IsMissionUnlocked(const std::string& scenario);

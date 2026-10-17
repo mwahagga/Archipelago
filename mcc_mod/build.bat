@@ -18,9 +18,10 @@ echo Using compiler: %CXX%
     -static -static-libgcc -static-libstdc++ ^
     -Ithird_party/minhook/include ^
     -I. ^
-    proxy_dxgi.cpp pipe_server.cpp hook_manager.cpp mod_main.cpp ^
+    proxy_dxgi.cpp pipe_server.cpp hook_manager.cpp mod_main.cpp pattern_scan.cpp ^
     engine/tag_system.cpp engine/object_table.cpp ^
     hooks/lobby_hooks.cpp hooks/weapon_hooks.cpp hooks/engine_hooks.cpp hooks/event_hooks.cpp ^
+    hooks/shell_command.cpp hooks/menu_hooks.cpp hooks/vfs_hooks.cpp ^
     third_party/minhook/src/hook.c third_party/minhook/src/buffer.c third_party/minhook/src/trampoline.c ^
     third_party/minhook/src/hde/hde64.c ^
     -o dxgi.dll ^

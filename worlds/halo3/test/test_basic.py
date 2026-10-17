@@ -46,3 +46,75 @@ class TestHalo3Presets(Halo3TestBase):
         self.assertIn("Tiered Weapons", options_presets)
         self.assertIn("Vanilla Combat", options_presets)
 
+
+class TestShieldProgressionVanilla(Halo3TestBase):
+    options = {"shield_progression": 0}
+
+    def test_item_count(self) -> None:
+        shield_items = [item.name for item in self.multiworld.itempool if item.name == "Progressive Shield Upgrade"]
+        self.assertEqual(len(shield_items), 0)
+
+
+class TestShieldProgressionProgressive(Halo3TestBase):
+    options = {"shield_progression": 1}
+
+    def test_item_count(self) -> None:
+        shield_items = [item.name for item in self.multiworld.itempool if item.name == "Progressive Shield Upgrade"]
+        self.assertEqual(len(shield_items), 3)
+
+
+class TestShieldProgressionProgressiveOvershield(Halo3TestBase):
+    options = {"shield_progression": 2}
+
+    def test_item_count(self) -> None:
+        shield_items = [item.name for item in self.multiworld.itempool if item.name == "Progressive Shield Upgrade"]
+        self.assertEqual(len(shield_items), 7)
+
+
+class TestShieldProgressionGlassCannon(Halo3TestBase):
+    options = {"shield_progression": 3}
+
+    def test_item_count(self) -> None:
+        shield_items = [item.name for item in self.multiworld.itempool if item.name == "Progressive Shield Upgrade"]
+        self.assertEqual(len(shield_items), 4)
+
+
+class TestShieldProgressionGlassCannonOvershield(Halo3TestBase):
+    options = {"shield_progression": 4}
+
+    def test_item_count(self) -> None:
+        shield_items = [item.name for item in self.multiworld.itempool if item.name == "Progressive Shield Upgrade"]
+        self.assertEqual(len(shield_items), 8)
+
+
+class TestDeathLinkOptions(Halo3TestBase):
+    options = {
+        "death_link": True,
+        "death_link_amnesty": 3,
+        "death_link_receive_hits": 2,
+        "death_link_effect": 1,
+    }
+
+    def test_slot_data_exports_deathlink(self) -> None:
+        slot_data = self.world.fill_slot_data()
+        self.assertTrue(slot_data["death_link"])
+        self.assertEqual(slot_data["death_link_amnesty"], 3)
+        self.assertEqual(slot_data["death_link_receive_hits"], 2)
+        self.assertEqual(slot_data["death_link_effect"], 1)
+
+
+class TestMinimalLocationsValidation(Halo3TestBase):
+    auto_construct = False
+    options = {
+        "include_skulls": False,
+        "include_terminals": False,
+        "include_rally_points": False,
+        "shield_progression": 1,
+    }
+
+    def test_minimal_locations_exceeding_items_raises_option_error(self) -> None:
+        from Options import OptionError
+
+        with self.assertRaises(OptionError):
+            self.world_setup()
+

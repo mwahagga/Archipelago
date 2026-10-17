@@ -1,12 +1,15 @@
 # Halo 3 Archipelago Architecture & IPC Protocol
 
-This document provides a comprehensive technical overview of the architecture connecting the **Archipelago MultiWorld** ecosystem to **Halo 3** running inside *Halo: The Master Chief Collection* (MCC).
+This document provides a comprehensive technical overview of the architecture
+connecting the **Archipelago MultiWorld** ecosystem to **Halo 3** running inside
+_Halo: The Master Chief Collection_ (MCC).
 
 ---
 
 ## 1. System Overview
 
-The integration spans three core components communicating across process and network boundaries:
+The integration spans three core components communicating across process and
+network boundaries:
 
 ```mermaid
 graph TD
@@ -16,203 +19,250 @@ graph TD
 
     subgraph PythonLayer [Python Client & APWorld]
         APWorld[worlds/halo3/<br/>Logic, Rules, Locations, Items]
-        Client[Halo3Client.py<br/>Protocol Handler, State Manager, Memory Watcher]
+        Client[worlds/halo3/client.py<br/>Protocol Handler, State Manager, Dual-Transport IPC]
     end
 
     subgraph MCCProcess [MCC-Win64-Shipping.exe Process Space]
-        Proxy[dxgi.dll Native Mod<br/>Proxy DLL, Named Pipe IPC Server, Detours]
+        Proxy[dxgi.dll Native Mod<br/>Proxy DLL, TCP & Named Pipe Server, MinHook Detours]
+        VFSHooks[VFS Hooks<br/>Scaleform .gfx Interception, Menu Pruning & Branding]
         H3Module[halo3.dll<br/>Campaign Engine, Tag Cache, Object Table, Interaction Pipeline]
     end
 
     Server <-->|WebSocket / JSON-RPC| Client
-    Client <-->|Named Pipe: \\.\pipe\Halo3Archipelago<br/>Live JSON State Sync| Proxy
-    Client -.->|ReadProcessMemory<br/>Scenario Ptr & PGCR Monitor| MCCProcess
-    Proxy <-->|MinHook In-Process Detours<br/>Candidate Qualification & Prompt Gating| H3Module
+    Client <-->|Dual Transport IPC: Localhost TCP :29500<br/>or Windows Named Pipe: \\.\pipe\Halo3Archipelago| Proxy
+    Proxy <-->|KernelBase File I/O Detours<br/>Scaleform UI Interception| VFSHooks
+    Proxy <-->|MinHook In-Process Detours & Byte Patches<br/>Candidate Qualification, Shields, Events| H3Module
 ```
 
 ### Component Roles
 
 1. **Archipelago World Definition (`worlds/halo3/`)**:
    - Implements `Halo3World(World)` for seed generation.
-   - Defines items (Mission Unlocks, Weapon Licenses, Equipment, Traps), locations (Mission Completions, Collectibles), YAML options, and progression logic graphs.
+   - Defines items (Mission Unlocks, Weapon Licenses, Shield Upgrades, Traps),
+     locations (Mission Completions, Collectibles, Rally Points), YAML options,
+     and progression logic graphs.
 
-2. **Archipelago Client (`Halo3Client.py`)**:
+2. **Archipelago Client (`worlds/halo3/client.py`)**:
    - Connects to the Archipelago server via WebSockets (`CommonContext`).
-   - Receives items, tracks received item indices, and reconciles state upon reconnection.
-   - Pushes live inventory/unlocked state to the native mod over a local Windows Named Pipe.
-   - Monitors MCC memory (`ReadProcessMemory`) for level transitions and Post-Game Carnage Reports (PGCR) to dispatch location checks automatically.
+     Registered as `"Halo 3 Client"` in `worlds/halo3/components.py`.
+   - Receives items, tracks received item indices, and reconciles state upon
+     reconnection.
+   - Pushes live inventory, weapon licensing, and shield progression state to
+     the native mod over a dual-transport IPC connection.
+   - Consumes live in-game events (skulls, terminals, rally points, mission
+     completions) reported by the native mod to dispatch location checks
+     automatically.
 
 3. **Native MCC Mod (`mcc_mod/dxgi.dll`)**:
    - Loads into `MCC-Win64-Shipping.exe` at startup via DXGI proxying.
-   - Runs a multithreaded Named Pipe IPC server (`\\.\pipe\Halo3Archipelago`).
-   - Hooks campaign lobby functions to prevent starting locked levels in the menus.
-   - Dynamically discovers `halo3.dll` when campaign missions load and installs hooks into Halo 3's native interaction qualification pipeline for real-time weapon and ally trading gating.
+   - Runs concurrent Localhost TCP (`127.0.0.1:29500`) and Windows Named Pipe
+     (`\\.\pipe\Halo3Archipelago`) IPC servers.
+   - Intercepts MCC file loading (VFS hooks) to prune irrelevant menus, brand
+     the interface for Archipelago, and skip intermediate submenus to jump
+     straight to mission selection.
+   - Hooks campaign lobby functions to enforce mission locks interactively
+     (retaining unlocked selections with audio feedback, preselecting available
+     levels, and blocking countdowns).
+   - Dynamically discovers `halo3.dll` when campaign missions load and detours
+     Halo 3's native interaction qualification pipeline for real-time weapon
+     licensing, ally trade gating, progressive shields, and event detection.
    - **Module structure:**
-     - `hook_manager.cpp` — Slim orchestrator with data-driven hook table for install/remove lifecycle.
-     - `engine/tag_system.cpp` — Tag instance resolution, O(1) weapon identification via Set 0xE StringIDs, dynamic tag scanning.
-     - `engine/object_table.cpp` — Object datum resolution via TLS, player identification, inventory enforcement.
-     - `hooks/lobby_hooks.cpp` — MCC CampaignLobby::StartCountdown interception for mission gating.
-     - `hooks/weapon_hooks.cpp` — All weapon interaction detours (candidate evaluation, prompt suppression, pickup/swap/trade gating).
-     - `hooks/engine_hooks.cpp` — Halo 3 simulation tick and MCC dispatch hooks.
-     - `hooks/event_hooks.cpp` — Rally point, terminal, and skull detection hooks. Fires events consumed by client via IPC.
-     - `memory_utils.h` — Shared `IsValidRead` pointer validation and `LOG_ONCE_PER_DATUM` macro.
+     - `hook_manager.cpp` — Slim orchestrator with data-driven hook table,
+       signature pattern scanning, and fallback management.
+     - `pattern_scan.h` / `pattern_scan.cpp` — Dynamic byte signature scanning
+       (`FindPatternInModule`) across module sections, resolving functions and
+       global structures with automatic RVA fallback.
+     - `engine/tag_system.cpp` — Tag instance resolution, O(1) weapon
+       identification via Set 0xE StringIDs, dynamic tag scanning.
+     - `engine/object_table.cpp` — Object datum resolution via TLS, player
+       identification, inventory enforcement, progressive shield scaling.
+     - `hooks/menu_hooks.cpp` — Scaleform mission carousel filtering
+       (`UIWidgetArray::AddItem` at `+0x895F54`), dynamically omitting locked
+       mission cards so only unlocked levels populate the campaign carousel.
+     - `hooks/shell_command.cpp` — Engine-level `ShellCommand` detour
+       (`IGameEngine` vtable slot 3) resolving `CreateGameEngine` to dispatch
+       clean teardown sequences upon mission completion.
+     - `hooks/vfs_hooks.cpp` — Virtual File System redirection
+       (`CreateFileW`/`A`, `ReadFile`, `GetOverlappedResult`,
+       `CreateFileMappingW`, `MapViewOfFile`) for Scaleform UI (`.gfx`) screens,
+       menu restructuring, and in-flight scenario map skull placement flag patching.
+     - `hooks/lobby_hooks.cpp` — MCC CampaignLobby interception
+       (`StartCountdown`, `CommitSelection`, `InitializeLevel`,
+       `RestartGameEngine`).
+     - `hooks/weapon_hooks.cpp` — All weapon interaction detours (candidate
+       evaluation, prompt suppression, pickup/swap/trade gating, unarmed
+       emergency exemption).
+     - `hooks/engine_hooks.cpp` — Halo 3 simulation tick, MCC engine dispatch,
+       and audio loop control hooks.
+     - `hooks/event_hooks.cpp` — Rally point, terminal, skull, and victory
+       detection hooks. Fires events consumed by the client via IPC.
+     - `pipe_server.cpp` — Concurrent Localhost TCP (`:29500`) and Windows Named
+       Pipe IPC servers.
+     - `memory_utils.h` — Shared `IsValidRead` pointer validation,
+       `FindFunctionByStringXref` dynamic function discovery, and
+       `LOG_ONCE_PER_DATUM` macro.
+     - `offsets.h` — Centralized memory address and struct offset registry.
 
 ---
 
-## 2. Named Pipe IPC Protocol
+## 2. Dual-Transport IPC Protocol
 
-State synchronization between `Halo3Client.py` and `dxgi.dll` uses a high-performance Windows Named Pipe:
+State synchronization between `worlds/halo3/client.py` and `dxgi.dll` supports
+**Dual-Transport IPC**:
 
-* **Pipe Name**: `\\.\pipe\Halo3Archipelago`
-* **Transport**: Full-duplex byte stream, text-mode UTF-8.
-* **Message Framing**: Newline-delimited JSON (`\n`). Each request receives a single JSON response line.
-* **Thread Safety**: State writes and reads in `dxgi.dll` are protected by a `std::mutex` (`g_modState.mtx`).
+1. **Localhost TCP Socket** (`127.0.0.1:29500`): Primary universal transport
+   defined in `worlds/halo3/constants.py`. Works out-of-the-box across Windows,
+   Linux (Wine/Proton), and Steam Deck without OS-specific IPC boundaries.
+2. **Windows Named Pipe** (`\\.\pipe\Halo3Archipelago`): Native Windows
+   fallback.
+3. **Transport Framing**: Full-duplex byte stream, text-mode UTF-8,
+   newline-delimited JSON (`\n`).
+4. **Thread Safety**: State writes and reads in `dxgi.dll` are protected by
+   `std::mutex` (`g_modState.mtx`) and `std::atomic` fields.
 
-### Protocol Specification
+### Handshake Greeting
 
-#### 1. `get_state`
-Queries the native mod's current internal state.
-* **Direction**: Client &rarr; Native Mod
-* **Request**:
-  ```json
-  {"cmd": "get_state"}
-  ```
-* **Response**:
+Upon establishing a connection, the native mod immediately sends a greeting
+line:
+
+```json
+{ "event": "mod_connected", "version": "1.0.0" }
+```
+
+---
+
+### Protocol Specification: Continuous State Sync & Event Delivery
+
+To ensure zero latency for in-game event detection and state propagation,
+`worlds/halo3/client.py` synchronizes state at 500ms intervals inside
+`mcc_watcher`:
+
+- **Direction**: Client &harr; Native Mod
+- **Client Request**:
   ```json
   {
-    "status": "ok",
     "unlocked_missions": ["Sierra 117", "Crow's Nest"],
-    "unlocked_weapons": ["assault_rifle", "needler", "spiker"],
-    "starting_weapon": "assault_rifle",
-    "weapon_mode": 1
-  }
-  ```
-
-#### 2. `set_unlocked_missions`
-Updates the list of authorized campaign missions.
-* **Direction**: Client &rarr; Native Mod
-* **Request**:
-  ```json
-  {
-    "cmd": "set_unlocked_missions",
-    "missions": ["Sierra 117", "Crow's Nest", "The Storm"]
-  }
-  ```
-* **Response**:
-  ```json
-  {"status": "ok", "message": "unlocked missions updated"}
-  ```
-
-#### 3. `set_unlocked_weapons`
-Updates the list of licensed weapons.
-* **Direction**: Client &rarr; Native Mod
-* **Request**:
-  ```json
-  {
-    "cmd": "set_unlocked_weapons",
-    "weapons": ["assault_rifle", "needler", "spiker", "plasma_pistol"]
-  }
-  ```
-* **Response**:
-  ```json
-  {"status": "ok", "message": "unlocked weapons updated"}
-  ```
-
-#### 4. `set_starting_weapon`
-Configures the default starter weapon granted if the player would otherwise be unarmed.
-* **Direction**: Client &rarr; Native Mod
-* **Request**:
-  ```json
-  {
-    "cmd": "set_starting_weapon",
-    "weapon": "assault_rifle"
-  }
-  ```
-* **Response**:
-  ```json
-  {"status": "ok", "message": "starting weapon updated"}
-  ```
-
-#### 5. `set_weapon_mode`
-Configures the active weapon licensing mode.
-* **Direction**: Client &rarr; Native Mod
-* **Request**:
-  ```json
-  {
-    "cmd": "set_weapon_mode",
-    "mode": 1
-  }
-  ```
-  *(Mode values: `0` = Disabled/Vanilla, `1` = Individual Licenses, `2` = Weapon Tiers)*
-* **Response**:
-  ```json
-  {"status": "ok", "message": "weapon mode updated"}
-  ```
-
-#### 6. Continuous State Sync & Event Delivery
-To ensure zero latency for in-game event detection, `Halo3Client.py` synchronizes state and polls the pipe server at 500ms intervals inside `mcc_watcher`.
-* **Direction**: Client &harr; Native Mod
-* **Client Request**:
-  ```json
-  {
-    "unlocked_missions": ["Sierra 117"],
-    "unlocked_weapons": ["assault_rifle"],
+    "unlocked_weapons": ["assault_rifle", "battle_rifle"],
     "weapon_license_mode": 1,
-    "starting_weapon": "assault_rifle"
+    "starting_weapon": "assault_rifle",
+    "max_shield_fraction": 1.5,
+    "deathlink_pending": "kill"
   }
   ```
-* **Native Mod Response**:
+  _(Parameters: `weapon_license_mode`: `0` = Vanilla/Disabled, `1` = Individual,
+  `2` = Tiers; `max_shield_fraction`: float multiplier e.g. `0.0` = Glass
+  Cannon, `1.0` = Vanilla, `2.0` = 200% Overshield; `deathlink_pending`:
+  optional penalty `"kill"`, `"shield_break"`, or `"mortal"`)_
+- **Native Mod Response**:
   ```json
   {
     "status": "ok",
     "events": [
       "rally_1:010_jungle",
       "skull_secondary_0:010_jungle",
-      "game_won:010_jungle"
+      "game_won:010_jungle",
+      "player_death"
     ]
   }
   ```
-  *(Event keys include the active scenario code resolved from `MCC_SCENARIO_STRUCT` (`mccBase + 0x03F8E778 -> +0x30`) to guarantee deterministic location attribution regardless of level transitions).*
+  _(Pending events are drained atomically from `g_modState.pendingEvents` upon
+  receipt of the request)._
+
+> [!NOTE] All live state synchronization occurs via this continuous JSON
+> payload. Standalone `cmd`-based requests from early design drafts are
+> consolidated into this single bidirectional sync loop.
 
 ---
 
-## 3. MCC Menu & Level Gating Lifecycle
+## 3. MCC Menu Navigation, VFS Interception & Lobby Gating
 
-To prevent players from entering locked missions from the MCC campaign menu:
+To provide a seamless, console-like randomizer experience, `dxgi.dll` overhauls
+MCC's frontend navigation:
 
-1. **Proxy Loading**:
-   - `MCC-Win64-Shipping.exe` loads `dxgi.dll` from its `mcc/binaries/win64/` directory.
-   - The proxy forwards genuine DirectX 11/12 calls to the system `C:\Windows\System32\dxgi.dll`.
+### 1. Scaleform UI Interception (VFS Hooks)
 
-2. **Lobby Interception**:
-   - When the player selects a mission and clicks "Start Game", MCC initiates countdown logic (`CampaignLobby::TryStartMatch` / `LaunchMission`).
-   - `dxgi.dll` inspects the selected scenario's chapter token (e.g. `$H3_Chapter_3-1_Title` &rarr; `010_jungle` &rarr; `Sierra 117`).
-   - If the mission is not present in `unlockedMissions`:
-     - The detour returns immediately without invoking the original engine function.
-     - The countdown never begins, and no game session is initialized.
-     - The player remains in the menu with complete navigation freedom (can select a different level, choose rally points, or back out).
+- `dxgi.dll` installs MinHook detours on Win32 file I/O APIs
+  (`KernelBase!CreateFileW`, `CreateFileA`, `ReadFile`, `GetOverlappedResult`,
+  `CreateFileMappingW`, `MapViewOfFile`).
+- Intercepts requests for MCC's Scaleform flash screens (`.gfx`):
+  - **Main Menu Streamlining**: Prunes irrelevant modes (Multiplayer, Firefight,
+    Forge, Theater) and brands the front-end for Archipelago.
+  - **Fast Navigation**: Selecting Campaign launches directly into Halo 3's
+    mission select screen, bypassing intermediate "Built-In vs Mods" and
+    playlist selection dialogs.
+
+### 2. Campaign Lobby Gating Lifecycle
+
+To prevent desynchronization or accidental loading into locked missions:
+
+```mermaid
+graph TD
+    OpenLobby[Player Opens Campaign Lobby] --> InitHook[Detour_InitializeLevel<br/>+0x509C24]
+    InitHook --> CheckSaved{Saved Level Unlocked?}
+    CheckSaved -- Yes --> KeepSaved[Retain Level]
+    CheckSaved -- No --> Redirect[Auto-Preselect First<br/>Unlocked Mission]
+
+    ClickLevel[Player Clicks Level in Menu] --> CommitHook[Detour_CommitSelection<br/>+0x50E1E4]
+    CommitHook --> CheckClick{Level Unlocked?}
+    CheckClick -- Yes --> AllowSelection[Select Level Cleanly]
+    CheckClick -- No --> BlockSelection[Play Audio Error Cue<br/>Smoothly Retain Selection]
+
+    ClickStart[Player Clicks 'Start Game'] --> StartHook[Detour_StartCountdown<br/>+0x5137EC]
+    StartHook --> CheckLive{Client Connected &<br/>Scenario Unlocked?}
+    CheckLive -- Yes --> Launch[Begin Countdown & Launch]
+    CheckLive -- No --> Abort[Suppress Countdown<br/>Player Stays in Menu]
+```
+
+1. **Auto-Preselection (`Detour_InitializeLevel` at `+0x509C24`)**:
+   - If MCC's save data had a locked mission selected, the lobby automatically
+     defaults to the player's first available unlocked mission
+     (`GetFirstUnlockedMissionIndex()`).
+2. **Interactive Selection Gating (`Detour_CommitSelection` at `+0x50E1E4`)**:
+   - Clicking a locked mission in the menu plays an immediate audio error cue
+     and smoothly retains the currently selected unlocked mission.
+3. **Countdown Guard (`Detour_StartCountdown` at `+0x5137EC`)**:
+   - Intercepts the countdown trigger. Verifies the chapter token (e.g.
+     `$H3_Chapter_3-1_Title` &rarr; `010_jungle` &rarr; `Sierra 117`) against
+     `unlockedMissions`.
+   - If locked or if the client is disconnected (`!IsClientConnected()`),
+     suppresses the countdown entirely.
+4. **Session Integrity**:
+   - Unlocks are tied strictly to active Archipelago connection state,
+     protecting players from launching campaigns while desynced or disconnected.
+
+### 3. Scaleform Carousel Widget Filtering (`hooks/menu_hooks.cpp`)
+
+To present only accessible campaign missions directly within MCC's campaign UI:
+- `dxgi.dll` intercepts `UIWidgetArray::AddItem` (RVA `+0x895F54`) via dynamic byte signature scanning with static RVA fallback.
+- When MCC populates the horizontal campaign mission selection carousel, `AddItem` is called for each candidate level item.
+- The detour verifies the item vtable and index getter to ensure it belongs to Halo 3.
+- It checks the mission scenario against `g_modState.unlockedMissions`. If locked, `DetourAddItem` returns `false` without appending the card to the UI carousel array.
+- This dynamically presents only currently unlocked missions to the player, while leaving other campaign selection flows (such as Halo 2 or Reach) completely stable and unaffected.
 
 ---
 
 ## 4. Halo 3 In-Engine Interaction Pipeline & Weapon Gating
 
-Early prototypes attempted post-pickup inventory stripping (`unit_add_weapon`), but this caused severe UX flaws: HUD prompts still appeared ("Hold [E] to swap"), button presses dropped held weapons onto locked items, and reload animations were repeatedly aborted by ground auto-pickup loops.
-
-The current architecture hooks the **native qualification phase** of Halo 3's interaction pipeline inside `halo3.dll`. For disassembly, decompilation workflows, and tool instructions using Ghidra, see [reverse_engineering_notes.md §6](reverse_engineering_notes.md#6-reverse-engineering-with-ghidra).
+Halo 3's weapon gating intercepts the **native qualification phase** of the
+interaction pipeline inside `halo3.dll`.
 
 ```mermaid
 graph TD
-    Aim[Crosshair Raycast / Proximity Scan] --> CandEval[weapon_evaluate_candidate<br/>halo3.dll + 0xEA6E4]
+    Aim[Crosshair Raycast / Proximity Scan] --> RayEval[raycast_evaluate_candidate<br/>halo3.dll + 0xEA4EC]
+    Aim --> CandEval[weapon_evaluate_candidate<br/>halo3.dll + 0xEA6E4]
     Aim --> TradeEval[can_trade_with_ally<br/>halo3.dll + 0x3578C8]
-    
-    CandEval -->|Is Weapon Unlocked?| CheckW{Unlocked?}
+
+    CandEval --> CheckUnarmed{Chief Unarmed?}
+    CheckUnarmed -- Yes --> AllowEmergency[Allow Weapon<br/>Emergency Unarmed Exemption]
+    CheckUnarmed -- No --> CheckW{Weapon Unlocked?}
+
     CheckW -- No --> RejectCand[Return false<br/>Candidate Rejected]
     CheckW -- Yes --> OrigCand[Original Candidate Evaluation]
-    
-    TradeEval -->|Is Weapon Unlocked?| CheckT{Unlocked?}
-    CheckT -- No --> RejectTrade[Return false<br/>Action 2 Trade Rejected]
+
+    TradeEval --> CheckT{Weapon Unlocked or Unarmed?}
+    CheckT -- No --> RejectTrade[Return false<br/>Trade Rejected]
     CheckT -- Yes --> OrigTrade[Original Trade Evaluation]
-    
+
     RejectCand --> NoPrompt[HUD Prompt NEVER Appears<br/>Auto-Pickup NEVER Triggers<br/>Reload NEVER Interrupted]
     RejectTrade --> NoTradePrompt[Trade Prompt NEVER Appears<br/>Allies Holding Locked Guns Ignored]
 
@@ -221,33 +271,82 @@ graph TD
     PromptGen --> HUD[Render 'Hold E to Swap/Trade']
 ```
 
-### Hook Architecture & Responsibilities
+### Emergency Unarmed Exemption
 
-| Hook Address | Engine Function | Responsibility in Archipelago Mod |
-|:---|:---|:---|
-| `halo3.dll + 0xEA6E4` | `weapon_evaluate_candidate` | **Master ground weapon candidate evaluator.** Returning `false` prevents the weapon from ever registering as an interaction candidate. HUD swap/pickup prompts never render, and pressing/holding [E] ignores the weapon. |
-| `halo3.dll + 0x3578C8` | `can_trade_with_ally` | **Ally trade candidate evaluator (`Action 2`).** Parameters: `(unitDatum, weaponDatum)`. Returning `false` when the weapon is locked completely suppresses "Hold [E] to trade weapons" prompts for Marines/allies holding locked guns. |
-| `halo3.dll + 0x35887C` | `unit_can_pickup_weapon` | **Universal weapon interactability gate.** Evaluates candidate suitability during crosshair raycasts, crate inspections (`+0x0EAB47`), and inventory queries. Locked weapons are rejected, while secondary slot verification during swaps (`+0x0EAD0F`) passes through safely. |
-| `halo3.dll + 0x3B2F18` | `unit_action_pickup_weapon` | **Proximity auto-pickup action handler.** Suppresses auto-pickup for locked weapons so Chief can stand on ground weapons and reload cleanly without animation interruption. |
-| `halo3.dll + 0x3B2DAC` | `unit_action_swap_weapon` | **Manual weapon swap action handler.** Monitors button-hold weapon swaps and ensures atomic exchange. |
-| `halo3.dll + 0x358024` | `unit_add_weapon` | **Final inventory addition gate.** Blocks script-based or cutscene additions of locked weapons while preserving the unarmed safety net. |
-| `halo3.dll + 0xB2538` | `Halo3EngineStep` | **Per-tick simulation hook.** Triggers dynamic tag table scan on first tick of each new level and runs `CheckAndEnforcePlayerInventory` to strip locked weapons and enforce the unarmed safety net. |
-| `halo3.dll + 0xF0810` | `game_insertion_point_unlock` | **Rally point unlock detection.** Parameter: `rallyIndex` in `ecx` (`1` = Bravo, `2` = Charlie). Generates `rally_N:<scenario>` event strings. |
-| `halo3.dll + 0x3A8798` | `terminal_activate` | **Terminal detection.** Native engine function invoked when player activates/reads a terminal device. Generates `terminal_N:<scenario>` events with fallback bitfield polling in `Halo3EngineStep`. |
-| `halo3.dll + 0x136088` | `campaign_metagame_award_primary_skull` | **Primary skull pickup detection.** Parameters: `(playerDatum in ecx, skullIndex in edx)`. Detects Iron, Black Eye, Tough Luck, Catch, Fog, Famine, Thunderstorm, Tilt, and Mythic skulls. Generates `skull_primary_N:<scenario>` events. |
-| `halo3.dll + 0x136580` | `campaign_metagame_award_secondary_skull` | **Secondary skull pickup detection.** Parameters: `(playerDatum in ecx, skullIndex in edx)`. Detects Blind, Cowbell, IWHBYD, and Grunt Birthday Party skulls. Generates `skull_secondary_N:<scenario>` events. |
-| `halo3.dll + 0x1F2F7C` | `game_won` | **Mission victory detection.** HS evaluator invoked upon campaign mission completion. Generates `game_won:<scenario>` event. |
-| `halo3.dll + 0xF05A3` | *Level Advance Branch Patch* | **Next mission bypass.** Byte patch changing `jne +0x2A` (`75 2A`) to `jmp +0x2A` (`EB 2A`). Skips `LoadNextCampaignLevel` (`+0x1398E4`) in the `game_won` handler and branches straight to session conclusion (`+0xF05CF`). |
-| `halo3.dll + 0x12EBC4` | `main_game_load_next_level` | **Next mission fallback guard.** Patched with `xor al, al; ret` (`30 C0 C3`) so returning `false` triggers the engine's natural fallback logic at `+0x12E619`, transitioning `halo3.dll` safely into an idle state. |
-| `MCC + 0x1E6424` | `RestartGameEngine` | **Menu transition interceptor.** When `WasGameWonFired()` is active, zeroes the queued scenario string in `MCC_SCENARIO_STRUCT` (`+0x3F8E778`) and delegates to the original handler with unmodified arguments to cleanly return to the MCC lobby. |
+To eliminate softlocks on levels where the player begins without weapons (such
+as Crow's Nest) or after empty-handed drops:
+
+- `UnitHasAnyWeapon` and `ChiefHasAnyWeapon` inspect the player's 4 inventory
+  slots (`unitObj + 0x268`).
+- If the player is completely unarmed, candidate rejection is bypassed across
+  `Detour_WeaponEvaluateCandidate`, `Detour_CanTradeWithAlly`,
+  `Detour_unit_can_pickup_weapon`, `Detour_unit_update_weapon_prompt`,
+  `Detour_unit_action_pickup_weapon`, and `Detour_unit_add_weapon`, allowing
+  Chief to acquire an initial emergency weapon.
 
 ---
 
-## 5. Universal O(1) Tag Identification (Set 0xE StringIDs)
+## 5. Dynamic Shield Progression & Audio Management
 
-A major hurdle in MCC modding is that tag indices vary across campaign maps (e.g. Needler is tag `0x0E87` on `010_jungle.map`, but a completely different index on `020_base.map`). 
+Archipelago introduces configurable **MJOLNIR Shield Progression** managed via
+`g_maxShieldFraction`:
 
-Halo 3 solves this internally via its **Switch-To StringID** compiled into every weapon tag definition at offset `+0x11C`. These StringIDs belong to **Set 0xE** (global engine strings compiled into `halo3.dll`) and are **100% constant across every single map in the game**:
+- **Glass Cannon Mode (`0.0`)**: Shields are locked at 0 vitality; player must
+  survive entirely on base health.
+- **Progressive Shields (`< 1.0`)**: Caps shield recharge at fractional capacity
+  (e.g. 25%, 50%, 75%).
+- **Vanilla Shields (`1.0`)**: Standard 100% capacity.
+- **Overshield Modes (`> 1.0` up to `3.0`)**: Allows shields to recharge beyond
+  100% (e.g. 150%, 200%, 300%).
+
+### Shield Engine Detours
+
+1. **Vitality Enforcement (`EnforcePlayerShields` in
+   `engine/object_table.cpp`)**:
+   - Executed on every simulation tick (`Halo3EngineStep`).
+   - Clamps shield vitality to `g_maxShieldFraction`.
+   - For overshields (> 100%), after vanilla recharge completes (1.0) and a
+     5-second damage cooldown expires, progressively recharges shield vitality
+     up to `maxFrac`.
+2. **Overshield Decay Bypass Patch (`halo3.dll + 0x36E5FA`)**:
+   - Patches `jbe +0x74` (`76 74`) to `jmp +0x74` (`EB 74`).
+   - Bypasses the campaign engine's hardcoded timer that automatically decays
+     shields above 1.5x down to 1.0x, allowing permanent overshields up to 3.0x.
+3. **Recharge Audio Silencer (`Detour_UnitUpdateSound` at
+   `halo3.dll + 0x1EC3C`)**:
+   - When shields are capped below 100% (< 1.0), Halo 3's engine continues
+     attempting to recharge shields, leaving the shield recharge sound loop
+     active indefinitely.
+   - `Detour_UnitUpdateSound` intercepts unit sound updates for units with
+     `soundFlags & 0x80`. When Chief's shields reach `maxFrac`, it clears unit
+     flag bit 10 (`0x400` on `chiefObj + 0x110`), cleanly silencing the looping
+     audio bug.
+
+### DeathLink Architecture & Execution
+
+1. **Vitality Offsets**:
+   - `H3_UNIT_HEALTH` (`+0xF4`): Current unit health float (`1.0f` = full, `<= 0.001f` = dead).
+   - `H3_UNIT_SHIELD` (`+0xF8`): Current unit shield vitality float (`1.0f` = full, `0.0f` = depleted).
+   - `H3_UNIT_RECHARGE_DELAY` (`+0x10C`): 16-bit shield recharge delay timer. Setting to `0` triggers immediate shield recharge.
+2. **Spawn Grace Period (`s_spawnGraceTicks = 180`)**:
+   - On map load or player datum change, a ~6 second debounce is engaged.
+   - During this period, map loading, scripting, and camera fade-in complete without interference.
+   - DeathLink penalties received while in menus or loading screens are preserved in `g_pendingDeathLinkEffect` and deferred until Chief has completed spawning, acquired his loadout (`ChiefHasAnyWeapon`), and confirmed vitality (`health > 0.50f`), preventing engine hangs on black loading screens.
+3. **Double Feedback Loop Suppression**:
+   - When an incoming DeathLink executes `kill`, `s_wasChiefAlive` is immediately set to `false` and a 300-tick (~10s) cooldown is asserted in C++. In Python, `is_penalty_death_pending` catches and consumes the event. This guarantees incoming deathlink penalties are never echoed back out to Archipelago as natural local deaths.
+
+---
+
+## 6. Universal O(1) Tag Identification (Set 0xE StringIDs)
+
+Tag indices vary across campaign maps, but Halo 3 compiles a **Switch-To
+StringID** into every weapon tag definition at offset `+0x11C`. These StringIDs
+belong to **Set 0xE** (global engine strings compiled into `halo3.dll`) and are
+**100% constant across every map**.
+
+Resolved via
+[GetWeaponNameFromS11C](file:///c:/Users/Jonathan/Projects/Code/Archipelago/Archipelago/mcc_mod/engine/tag_system.cpp#L50-L77)
+in `engine/tag_system.cpp`:
 
 ```
 Tag Datum (0x????xxxx)
@@ -262,75 +361,139 @@ Tag Datum (0x????xxxx)
                                                          Switch-To StringID (Set 0xE)
 ```
 
-### Verified Set 0xE Switch-To StringID Table
+### Verified Set 0xE Switch-To StringID Table (`tag_system.cpp:51-76`)
 
-| StringID (`s11c`) | Canonical Weapon Key | Weapon Name / Description |
-|:---|:---|:---|
-| `0xE112` | `assault_rifle` | MA5C Individual Combat Weapon System |
-| `0xE113` | `smg` | M7/Caseless Submachine Gun |
-| `0xE114` | `covenant_carbine` | Type-51 Carbine |
-| `0xE116` | `battle_rifle` | BR55HB Service Rifle |
-| `0xE117` | `beam_rifle` | Type-50 Particle Beam Rifle |
-| `0xE119` | `rocket_launcher` | M41 Surface-to-Surface Rocket Medium Anti-Vehicle |
-| `0xE11A` | `machinegun_turret` | Detachable AIE-486H Heavy Machine Gun |
-| `0xE11D` | `sentinel_beam` | Sentinel Beam (Major variant) |
-| `0xE11F` | `flak_cannon` | Type-52 Pistol (Fuel Rod Gun) |
-| `0xE120` | `flamethrower` | M7057 Defoliant Projector |
-| `0xE122` | `shotgun` | M90A Close Quarters Weapon System |
-| `0xE123` | `magnum` | M6G Personal Defense Weapon System |
-| `0xE124` | `missile_pod` | LAU-65D/SGM-151 Missile Pod |
-| `0xE125` | `needler` | Type-33 Guided Munitions Launcher |
-| `0xE126` | `gravity_hammer` | Type-2 Energy Weapon/Hammer |
-| `0xE129` | `plasma_pistol` | Type-25 Directed Energy Pistol |
-| `0xE12A` | `plasma_rifle` | Type-25 Directed Energy Rifle |
-| `0xE12B` | `sniper_rifle` | SRS99D-S2 AM Sniper Rifle |
-| `0xE12C` | `mauler` | Type-52 Pistol |
-| `0xE12D` | `plasma_cannon` | Detachable Type-52 Plasma Cannon |
-| `0xE12E` | `sentinel_beam` | Standard Aggressor Sentinel Beam |
-| `0xE12F` | `brute_shot` | Type-25 Grenade Launcher |
-| `0xE130` | `spartan_laser` | Weapon/Anti-Vehicle Model 6 Grindell/Galilean Non-Linear Rifle |
-| `0xE131` | `energy_sword` | Type-1 Energy Weapon/Sword |
-| `0xE132` | `spiker` | Type-25 Carbine |
+| StringID (`s11c`) | Canonical Weapon Key | Weapon Name / Description                                      |
+| :---------------- | :------------------- | :------------------------------------------------------------- |
+| `0xE112`          | `assault_rifle`      | MA5C Individual Combat Weapon System                           |
+| `0xE114`          | `battle_rifle`       | BR55HB Service Rifle                                           |
+| `0xE116`          | `brute_shot`         | Type-25 Grenade Launcher                                       |
+| `0xE117`          | `covenant_carbine`   | Type-51 Carbine                                                |
+| `0xE119`          | `energy_sword`       | Type-1 Energy Weapon/Sword                                     |
+| `0xE11A`          | `mauler`             | Type-52 Pistol (Mauler)                                        |
+| `0xE11D`          | `flamethrower`       | M7057 Defoliant Projector                                      |
+| `0xE11F`          | `flak_cannon`        | Type-52 Pistol (Fuel Rod Gun)                                  |
+| `0xE120`          | `gravity_hammer`     | Type-2 Energy Weapon/Hammer                                    |
+| `0xE122`          | `machinegun_turret`  | Detachable AIE-486H Heavy Machine Gun                          |
+| `0xE123`          | `magnum`             | M6G Personal Defense Weapon System                             |
+| `0xE124`          | `missile_pod`        | LAU-65D/SGM-151 Missile Pod                                    |
+| `0xE125`          | `needler`            | Type-33 Guided Munitions Launcher                              |
+| `0xE126`          | `beam_rifle`         | Type-50 Particle Beam Rifle                                    |
+| `0xE129`          | `plasma_pistol`      | Type-25 Directed Energy Pistol                                 |
+| `0xE12A`          | `plasma_rifle`       | Type-25 Directed Energy Rifle                                  |
+| `0xE12B`          | `plasma_cannon`      | Detachable Type-52 Plasma Cannon                               |
+| `0xE12C`          | `spartan_laser`      | Weapon/Anti-Vehicle Model 6 Grindell/Galilean Non-Linear Rifle |
+| `0xE12D`          | `rocket_launcher`    | M41 Surface-to-Surface Rocket Medium Anti-Vehicle              |
+| `0xE12E`          | `sentinel_beam`      | Standard Aggressor Sentinel Beam                               |
+| `0xE12F`          | `shotgun`            | M90A Close Quarters Weapon System                              |
+| `0xE130`          | `smg`                | M7/Caseless Submachine Gun                                     |
+| `0xE131`          | `sniper_rifle`       | SRS99D-S2 AM Sniper Rifle                                      |
+| `0xE132`          | `spiker`             | Type-25 Carbine                                                |
 
-*Lookup Performance*: O(1) direct switch statement with zero dynamic string allocations and zero lock contention.
+### Skull & Oddball Distinction
 
-### Skull & Oddball StringID Collision Resolution
-In Halo 3 tag definitions (`weap`), campaign skulls (`primary_skull.weapon`, `secondary_skull.weapon`) and the multiplayer oddball share the Switch-To StringID `0xE113` with the SMG.
+Campaign skulls and the multiplayer oddball compile with Switch-To StringID
+`0xE113` (distinct from SMG at `0xE130`). To guarantee skulls can always be
+picked up:
 
-If unhandled, dynamic tag scanning registers both skulls as `"smg"`. When SMG is locked in an Archipelago seed, the mod's weapon interaction hooks (`weapon_evaluate_candidate`, `unit_can_pickup_weapon`, `unit_action_pickup_weapon`) treat skulls as locked SMGs, suppressing HUD pickup prompts ("Hold [E] to pick up skull") and auto-pickup.
-
-To differentiate skulls and oddballs from the SMG:
-* **Weapon Type (`tagDef + 0x18C`, uint16_t)**: Set to `11` (`_weapon_type_ball`) for skulls and oddball, whereas firearms have values `!= 11` (e.g. 0).
-
-In `ScanAndRegisterMapWeapons`, tags with `weaponType == 11` are skipped during dynamic weapon registration. In `IsTagUnlocked`, tags with `weaponType == 11` return `true` unconditionally, ensuring skulls can always be picked up regardless of weapon licensing state.
+- **Weapon Type (`tagDef + 0x18C`, uint16_t)**: Set to `11`
+  (`_weapon_type_ball`) for skulls/oddball, but `!= 11` for firearms.
+- Tags with `weaponType == 11` are skipped during weapon licensing registration
+  and return `true` unconditionally in `IsTagUnlocked`.
 
 ---
 
-## 6. Campaign Mission Auto-Detection & Clean Menu Return
+## 7. Campaign Mission Auto-Detection & Clean Menu Return
 
-Campaign completion and level transition prevention use coordinated detours across both `halo3.dll` and `MCC-Win64-Shipping.exe`:
+Campaign completion and playlist prevention use coordinated detours and byte
+patches across both `halo3.dll` and `MCC-Win64-Shipping.exe`:
 
-### Pathway 1: Mission Completion & Auto-Exit via MCC `RestartGameEngine` (+0x1E6424)
-When a campaign level is beaten:
-1. Halo 3 fires `game_won` (`halo3.dll + 0x1F2F7C`), which emits the `game_won:<scenario>` event across IPC to `Halo3Client.py`.
-2. When MCC receives match completion, it attempts to advance the playlist by invoking `MCC-Win64-Shipping.exe + 0x1E6424` (`RestartGameEngine`).
-3. `Detour_RestartGameEngine` intercepts this call, clears the queued scenario string at `MCC_SCENARIO_STRUCT` (`mccBase + 0x03F8E778 -> +0x30`), and suppresses execution of the original function.
-4. MCC cleanly halts campaign playlist progression and returns the player to the PGCR / main menu without automated UI clicks or synthetic keystrokes.
-
-### Pathway 2: Post-Game Carnage Report (PGCR) Detection (Fallback)
-If the player finishes a level and returns to the menu or game summary screen:
-- PGCR flag: `MCC-Win64-Shipping.exe + 0x4000B8C + 0xC`.
-- When the flag transitions to `1`, the client detects completion, logs the victory, and dispatches the corresponding check.
+1. **`game_won` Detour (`halo3.dll + 0x1F2F7C`)**:
+   - Fires upon level completion; emits `game_won:<scenario>` across IPC to
+     `worlds/halo3/client.py`.
+   - Signals `g_quitAfterComplete = true` to trigger clean engine return.
+2. **Engine-Level `ShellCommand` Teardown (`halo3.dll` IGameEngine vtable[3])**:
+   - `Detour_ShellCommand` intercepts the next command queued on the engine.
+   - Dispatches a 3-stage engine teardown sequence:
+     - `ShellCommand(engineObj, 0x0, nullptr)` (Pause engine)
+     - `ShellCommand(engineObj, 0xD, nullptr)` (Teardown session & return to menu)
+     - `ShellCommand(engineObj, 0x1, nullptr)` (Resume main loop)
+   - Guarantees immediate, clean return to the campaign menu across all levels.
+3. **Next Level Skip Byte Patch (`halo3.dll + 0xF05A3`)**:
+   - Patches `jne +0x2A` (`75 2A`) to `jmp +0x2A` (`EB 2A`). Bypasses
+     `LoadNextCampaignLevel` (`+0x1398E4`) in the `game_won` handler and
+     branches straight to session conclusion (`+0xF05CF`).
+4. **Engine Fallback Loader Byte Patch (`halo3.dll + 0x12EBC4`)**:
+   - Directly patches `main_game_load_next_level` to `xor al, al; ret`
+     (`30 C0 C3`), forcing it to return `false` immediately and transitioning
+     `halo3.dll` cleanly into an idle state.
+5. **Outro Vehicle Camera Guard Detour (`halo3.dll + 0x355E20`)**:
+   - `Detour_UnitGetSeatCamera` guards against null parent vehicle dereferences
+     during outro cutscenes (preventing crash at `+0x355EB9`).
+6. **Menu Transition Interceptor Detour (`MCC + 0x1E6424`)**:
+   - `Detour_RestartGameEngine` intercepts playlist advance requests, clears the
+     queued scenario string in `MCC_SCENARIO_STRUCT`
+     (`mccBase + 0x03F8E778 -> +0x30`), and safely returns the player to the
+     menu.
 
 ---
 
-## 7. Memory Safety & Robustness Guarantees
+## 8. Complete Hook & Memory Offset Reference
 
-Because Halo 3 dynamically loads, allocates, and frees entities across simulation and rendering threads, all pointer dereferencing in `dxgi.dll` follows strict safety rules:
+All memory offsets and byte patch targets are centralized in
+`mcc_mod/offsets.h`:
 
-1. **`IsValidRead` Pointer Validation** (defined in `memory_utils.h`):
+### MCC-Win64-Shipping.exe Hooks & Patches
+
+| Offset / Target   | Type            | Description                                                                                                                                                               |
+| :---------------- | :-------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `+0x5137EC`       | MinHook Detour  | `CampaignLobby::StartCountdown` — Blocks match countdown for locked missions.                                                                                             |
+| `+0x50E1E4`       | MinHook Detour  | `CampaignLobby::CommitSelection` — Interactive selection gating with audio error feedback.                                                                                |
+| `+0x509C24`       | MinHook Detour  | `CampaignLobby::InitializeLevel` — Auto-preselects first available unlocked level.                                                                                        |
+| `+0x42D6F8`       | MinHook Detour  | `MCC Engine Dispatch` — Runs synchronously on main MCC simulation/render thread.                                                                                          |
+| `+0x1E6424`       | MinHook Detour  | `RestartGameEngine` — Intercepts playlist advance; returns cleanly to lobby.                                                                                              |
+| `+0x895F54`       | MinHook Detour  | `UIWidgetArray::AddItem` (`MCC_ADD_ITEM`) — Intercepts mission carousel population; filters locked campaign missions.                                                     |
+| _KernelBase APIs_ | MinHook Detours | VFS detours (`CreateFileW`, `CreateFileA`, `ReadFile`, `GetOverlappedResult`, `CreateFileMappingW`, `MapViewOfFile`) for Scaleform `.gfx` streamlining, branding, and in-flight map skull placement flag patching. |
+
+### halo3.dll Hooks & Byte Patches
+
+| Offset / Target | Type           | Description                                                                                                 |
+| :-------------- | :------------- | :---------------------------------------------------------------------------------------------------------- |
+| `vtable[3]`     | MinHook Detour | `IGameEngine::ShellCommand` — Engine-level teardown (Pause `0x0` -> Teardown `0xD` -> Resume `0x1`).        |
+| `+0xEA4EC`      | MinHook Detour | `raycast_evaluate_candidate` — Evaluates objects intersecting player crosshair raycast.                     |
+| `+0xEA1A8`      | MinHook Detour | `device_evaluate_candidate` — Evaluates devices, crates, and vehicles under crosshair.                      |
+| `+0xEA6E4`      | MinHook Detour | `weapon_evaluate_candidate` — Master ground weapon candidate evaluator; suppresses HUD prompts.             |
+| `+0x3578C8`     | MinHook Detour | `can_trade_with_ally` — Ally weapon trading candidate evaluator (Action 2).                                 |
+| `+0x35887C`     | MinHook Detour | `unit_can_pickup_weapon` — Universal weapon interactability gate for raycasts and queries.                  |
+| `+0x3B59EC`     | MinHook Detour | `unit_update_weapon_prompt` — Evaluates and renders ground weapon pickup/swap HUD prompts.                  |
+| `+0x3B2DAC`     | MinHook Detour | `unit_action_swap_weapon` — Manual button-hold weapon swap action handler.                                  |
+| `+0x3B2F18`     | MinHook Detour | `unit_action_pickup_weapon` — Proximity auto-pickup handler; suppresses reload interruptions.               |
+| `+0x358024`     | MinHook Detour | `unit_add_weapon` — Blocks script/cutscene additions of locked weapons.                                     |
+| `+0xB2538`      | MinHook Detour | `Halo3EngineStep` — Per-tick simulation hook; runs inventory & shield enforcement.                          |
+| `+0xF0810`      | MinHook Detour | `game_insertion_point_unlock` — Rally point unlock detection (`1` = Bravo, `2` = Charlie).                  |
+| `+0x3A8798`     | MinHook Detour | `terminal_activate` — Terminal activation and reading detection.                                            |
+| `+0x136088`     | MinHook Detour | `campaign_metagame_award_primary_skull` — Primary skull pickup detection.                                   |
+| `+0x136580`     | MinHook Detour | `campaign_metagame_award_secondary_skull` — Secondary skull pickup detection.                               |
+| `+0x1F2F7C`     | MinHook Detour | `game_won` — Mission victory detection; dispatches event via IPC.                                           |
+| `+0x1398E4`     | MinHook Detour | `load_next_campaign_level` — Blocks advancing to next level after game_won.                                 |
+| `+0x34D568`     | Direct Call    | `object_kill(uint32_t objectDatum)` — Native engine function to kill Chief, trigger physics ragdoll, and reload checkpoint. |
+| `+0x355E20`     | MinHook Detour | `unit_get_seat_camera` — Guards against vehicle despawn crash during outro cutscenes.                       |
+| `+0x1EC3C`      | MinHook Detour | `unit_update_sound` — Silences looping recharge sound effect when shields < 100%.                           |
+| `+0xF05A3`      | Byte Patch     | `H3_GAME_WON_SKIP_NEXT_LEVEL_PATCH` (`75 2A` &rarr; `EB 2A`) — Skips next mission prep in `game_won`.       |
+| `+0x12EBC4`     | Byte Patch     | `H3_MAIN_GAME_LOAD_NEXT_LEVEL` (`40 55 48` &rarr; `30 C0 C3`) — Forces next level loader to return `false`. |
+| `+0x36E5FA`     | Byte Patch     | `H3_OVERSHIELD_DECAY_PATCH` (`76 74` &rarr; `EB 74`) — Enables permanent overshields up to 3.0x.            |
+| `+0x12FF57`     | Byte Patch     | `H3_SKULL_EASY_DIFFICULTY_PATCH` (6x NOP) — Bypasses difficulty >= Normal check for skull eligibility.      |
+| `+0x12FFCC`     | Byte Patch     | `H3_SKULL_INSERTION_POINT_PATCH` (`xor r8w, r8w`) — Bypasses Rally Point Alpha restriction for skulls.      |
+| `+0x13627F`     | Byte Patch     | `H3_METAGAME_SKULL_DIFFICULTY_PATCH` (2x NOP) — Bypasses difficulty check in metagame skull progression.   |
+| `+0xF03CA`      | Byte Patch     | `H3_MISSION_COMPLETE_INSERTION_PATCH` (6x NOP) — Grants mission completion skull credit on mid-mission starts. |
+
+---
+
+## 9. Memory Safety & Robustness Guarantees
+
+1. **`IsValidRead` Pointer Validation** (`memory_utils.h`):
+
    ```cpp
-   // memory_utils.h — shared inline used by all engine and hook modules
    namespace Halo3AP {
        inline bool IsValidRead(const void* p, size_t size) {
            uintptr_t v = (uintptr_t)p;
@@ -338,10 +501,25 @@ Because Halo 3 dynamically loads, allocates, and frees entities across simulatio
        }
    }
    ```
-   Every object pointer resolved via `GetObjectPtr` is checked against valid user-mode 64-bit address space before any member offsets or tag datums are read.
 
-2. **TLS Thread Fallback**:
-   Object table resolution uses Halo 3's thread-local storage (`gs:[0x58] + tlsIndex*8 + 0x38 -> +0x48`). If called from a non-simulation thread (such as the HUD rendering pass), it gracefully falls back to `g_cachedObjectTableData` captured during the last simulation step.
+   Every object pointer resolved via `GetObjectPtr` is checked against valid
+   user-mode 64-bit address space before any member offsets or tag datums are
+   read.
 
-3. **Clean Module Lifecycle**:
-   A dedicated background thread monitors `halo3.dll`. When the game unloads a map and frees `halo3.dll`, all hooks are cleanly disabled and uninstalled via `RemoveHalo3Hooks()` before the module memory is unmapped, preventing access violation crashes on engine transitions.
+2. **TLS Thread Fallback**: Object table resolution uses Halo 3's thread-local
+   storage (`gs:[0x58] + tlsIndex*8 + 0x38 -> +0x48`). If called from a
+   non-simulation thread (such as the HUD rendering pass), it gracefully falls
+   back to `g_cachedObjectTableData` captured during the last simulation step.
+
+3. **Clean Module Lifecycle**: A dedicated background thread monitors
+   `halo3.dll`. When the game unloads a map and frees `halo3.dll`, all hooks are
+   cleanly disabled and uninstalled via `RemoveHalo3Hooks()` before the module
+   memory is unmapped, preventing access violation crashes on engine
+   transitions.
+
+4. **`VirtualQuery` Memory Safety**: In `lobby_hooks.cpp` and `vfs_hooks.cpp`,
+   pointer validation is backed by `VirtualQuery` (`IsMemoryReadable`) instead
+   of deprecated APIs like `IsBadReadPtr`. On x64 Windows 10/11, passing
+   non-canonical or unmapped addresses to `IsBadReadPtr` raises fatal access
+   violations; `VirtualQuery` safely verifies committed readable pages without
+   throwing exceptions.

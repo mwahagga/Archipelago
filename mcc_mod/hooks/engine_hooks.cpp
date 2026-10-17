@@ -1,5 +1,6 @@
 #include "engine_hooks.h"
 #include "event_hooks.h"
+#include "shell_command.h"
 #include "../engine/tag_system.h"
 #include "../engine/object_table.h"
 #include "../memory_utils.h"
@@ -15,15 +16,22 @@ extern bool      g_mapScanned;
 Halo3EngineStep_t   g_originalHalo3EngineStep   = nullptr;
 MccEngineDispatch_t g_originalMccEngineDispatch = nullptr;
 UnitGetSeatCamera_t g_originalUnitGetSeatCamera = nullptr;
+UnitUpdateSound_t   g_originalUnitUpdateSound   = nullptr;
 void*               g_targetHalo3EngineStep     = nullptr;
 void*               g_targetMccEngineDispatch   = nullptr;
 void*               g_targetUnitGetSeatCamera   = nullptr;
+void*               g_targetUnitUpdateSound     = nullptr;
 
 void __fastcall Detour_Halo3EngineStep() {
     static bool s_loggedEngineStep = false;
     if (!s_loggedEngineStep) {
         s_loggedEngineStep = true;
         Log("[Halo3EngineStep] Running on game simulation thread. tid=%lu", GetCurrentThreadId());
+    }
+
+    // Ensure ShellCommand hook is active (engine object is guaranteed instantiated once simulation steps)
+    if (!IsShellCommandHookActive() && g_halo3Base) {
+        InstallShellCommandHook((HMODULE)g_halo3Base);
     }
 
     // On first simulation tick after map load, scan the tag table to discover all weapon tag indices.
@@ -41,8 +49,41 @@ void __fastcall Detour_Halo3EngineStep() {
     // Run inventory enforcement directly from the game's simulation thread!
     CheckAndEnforcePlayerInventory(g_halo3Base);
 
+    // Run shield enforcement directly from the game's simulation thread!
+    EnforcePlayerShields(g_halo3Base);
+
     // Poll campaign terminal bitfield directly from the game's simulation thread!
     CheckPendingTerminals(g_halo3Base);
+}
+
+void __fastcall Detour_UnitUpdateSound(uint32_t unitDatum, uint32_t soundFlags) {
+    // When updating shield sound (flag 0x80) for the local player:
+    // If Chief's shields have recharged to his unlocked cap (< 100%), clamp to the cap
+    // and clear bit 10 of flags (0x110) before the sound emitter processes it,
+    // naturally silencing the recharge sound loop without artificially spoofing the shield value.
+    if (g_halo3Base && (soundFlags & 0x80)) {
+        uint32_t chiefDatum = g_localPlayerDatum.load();
+        if (chiefDatum != 0xFFFFFFFF && chiefDatum != 0 && unitDatum == chiefDatum) {
+            void* chiefObj = GetObjectPtr(g_halo3Base, chiefDatum);
+            if (chiefObj && IsValidRead(chiefObj, Halo3Offsets::H3_UNIT_SHIELD + sizeof(float))) {
+                float* pShield = (float*)((uintptr_t)chiefObj + Halo3Offsets::H3_UNIT_SHIELD);
+                float maxFrac = g_maxShieldFraction.load();
+                if (maxFrac < 1.0f) {
+                    if (*pShield >= maxFrac - 0.001f) {
+                        *pShield = maxFrac;
+                        uint32_t* pFlags = (uint32_t*)((uintptr_t)chiefObj + Halo3Offsets::H3_UNIT_FLAGS);
+                        if (IsValidRead(pFlags, sizeof(uint32_t))) {
+                            *pFlags &= ~0x400; // Clear bit 10 (shield recharge sound flag)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (g_originalUnitUpdateSound) {
+        g_originalUnitUpdateSound(unitDatum, soundFlags);
+    }
 }
 
 void* __fastcall Detour_MccEngineDispatch(void* a1, void* a2, void* a3, void* a4) {

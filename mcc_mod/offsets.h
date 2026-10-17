@@ -15,6 +15,15 @@ namespace Halo3Offsets {
     // CampaignLobby::StartCountdown detour: clean convergence point for starting match
     constexpr uintptr_t MCC_START_COUNTDOWN     = 0x5137EC;
 
+    // CampaignLobby::CommitSelection detour: intercepts mission and option selection commits
+    constexpr uintptr_t MCC_COMMIT_SELECTION     = 0x50E1E4;
+    constexpr uintptr_t MCC_GET_SELECTED_ITEM    = 0x4BC600;
+    constexpr uint32_t  MCC_SCREEN_MISSION_SELECT = 0x6FDD6E37;
+
+    // CampaignLobby level initialization & UI update
+    constexpr uintptr_t MCC_INITIALIZE_LEVEL        = 0x509C24;
+    constexpr uintptr_t MCC_UPDATE_SELECTED_MISSION = 0x50B2AC;
+
     // MCC Engine Dispatch: runs synchronously on the main simulation/render thread
     constexpr uintptr_t MCC_ENGINE_DISPATCH     = 0x42D6F8;
 
@@ -32,6 +41,8 @@ namespace Halo3Offsets {
     // Signature: void __fastcall RestartGameEngine(void* pThis, int32_t reason, void* r8, void* r9)
     constexpr uintptr_t MCC_RESTART_GAME_ENGINE = 0x1E6424;
     constexpr uintptr_t MCC_RESTART_REASON      = 0x4000B70;
+
+
 
     // ------------------------------------------------------------------------
     // halo3.dll Offsets
@@ -106,10 +117,24 @@ namespace Halo3Offsets {
     constexpr uintptr_t H3_UNIT_DROP_WEAPON     = 0x359FBC;
     constexpr uintptr_t H3_PLACEMENT_NEW        = 0x341508;
     constexpr uintptr_t H3_OBJECT_NEW           = 0x341AE8;
+    constexpr uintptr_t H3_OBJECT_KILL          = 0x34D568;    // void __fastcall object_kill(uint32_t objectDatum)
 
     // Struct internal member offsets
+    constexpr uintptr_t H3_UNIT_MAX_SHIELD      = 0xF0;    // Base maximum shield vitality (float)
+    constexpr uintptr_t H3_UNIT_HEALTH          = 0xF4;    // Current unit health (float)
+    constexpr uintptr_t H3_UNIT_SHIELD          = 0xF8;    // Current unit shield vitality (float)
+    constexpr uintptr_t H3_UNIT_RECHARGE_DELAY  = 0x10C;   // 16-bit shield recharge delay timer; 0x7FFF = paused/full
+    constexpr uintptr_t H3_UNIT_FLAGS           = 0x110;   // Unit status bitflags; bit 10 (0x400) = recharge sound loop
     constexpr uintptr_t H3_UNIT_INVENTORY       = 0x268;   // 4 slots of 4 bytes each
     constexpr uintptr_t H3_TAG_STRING_ID_S11C   = 0x11C;   // Switch-To StringID in tag definition
+
+    // Overshield decay branch patch (+0x36E5FA): changes 'jbe +0x74' (0x76 0x74) to 'jmp +0x74' (0xEB 0x74).
+    // Bypasses the campaign engine's automatic decay of shields above 1.5x, allowing permanent overshields up to 3.0x.
+    constexpr uintptr_t H3_OVERSHIELD_DECAY_PATCH        = 0x36E5FA;
+
+    // unit_update_sound detour (+0x1EC3C): updates sound emitters for units based on sound flags.
+    // Detoured to silence the shield recharge audio loop (flag 0x80) when Chief's shields are at full unlocked cap (< 100%).
+    constexpr uintptr_t H3_UNIT_UPDATE_SOUND             = 0x1EC3C;
 
     // ------------------------------------------------------------------------
     // Event Detection (Rally Points, Terminals, Skulls)
@@ -169,5 +194,28 @@ namespace Halo3Offsets {
     // main_game_load_next_level (+0x12EBC4): the core internal function that logs 'level completed'
     // and triggers map transition. Patched to return false immediately as defense-in-depth.
     constexpr uintptr_t H3_MAIN_GAME_LOAD_NEXT_LEVEL     = 0x12EBC4;
+
+    // ------------------------------------------------------------------------
+    // Campaign Skull Eligibility & Spawning Patches
+    // ------------------------------------------------------------------------
+    // 1. Easy difficulty eligibility check bypass (+0x12FF57):
+    //    'jl +0x9C' (0x0F 0x8C 0x9C 0x00 0x00 0x00) -> 6x NOP (0x90).
+    //    Allows campaign skulls to be unlocked/awarded on Easy difficulty (difficulty 0).
+    constexpr uintptr_t H3_SKULL_EASY_DIFFICULTY_PATCH      = 0x12FF57;
+
+    // 2. Mid-mission insertion point check bypass (+0x12FFCC):
+    //    'test r8w, r8w' (0x66 0x45 0x85 0xC0) -> 'xor r8w, r8w' (0x66 0x45 0x31 0xC0).
+    //    Clears insertion index to 0 for skull eligibility so Rally Points Bravo and Charlie qualify.
+    constexpr uintptr_t H3_SKULL_INSERTION_POINT_PATCH      = 0x12FFCC;
+
+    // 3. Metagame difficulty bypass (+0x13627F):
+    //    'jle +0x6B' (0x7E 0x6B) -> 2x NOP (0x90 0x90).
+    //    Allows the metagame skull progression handler (+0x136248) to process skulls on Easy difficulty.
+    constexpr uintptr_t H3_METAGAME_SKULL_DIFFICULTY_PATCH  = 0x13627F;
+
+    // 4. Mission completion insertion check bypass (+0xF03CA):
+    //    'jne +0xAC' (0x0F 0x85 0xAC 0x00 0x00 0x00) -> 6x NOP (0x90).
+    //    Ensures the end-of-mission handler (+0xF0268) processes skull completion even when starting from mid-mission rally points.
+    constexpr uintptr_t H3_MISSION_COMPLETE_INSERTION_PATCH = 0xF03CA;
 }
 

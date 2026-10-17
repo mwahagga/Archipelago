@@ -154,7 +154,7 @@ def detect_mcc_path() -> Optional[str]:
 
 def is_mcc_running() -> bool:
     """Return True if any MCC process is currently running."""
-    target_exes = {"mcc-win64-shipping.exe", "mcclauncher.exe"}
+    target_exes = {"mcc-win64-shipping.exe"}
     if sys.platform == "win32" and ctypes is not None:
         kernel32 = ctypes.windll.kernel32
         h_snap = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
@@ -345,17 +345,39 @@ def spawn_watchdog(mcc_pid: int, dxgi_path: str) -> None:
     if mcc_pid <= 0 or not dxgi_path:
         return
 
-    popen_kwargs: dict[str, Any] = {"close_fds": True}
+    popen_kwargs: dict[str, Any] = {
+        "close_fds": True,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    python_exe = sys.executable
+
     if sys.platform == "win32":
-        # Windows creation flags for detached background process with no console window
-        # DETACHED_PROCESS = 0x00000008, CREATE_NO_WINDOW = 0x08000000
-        popen_kwargs["creationflags"] = 0x00000008 | 0x08000000
+        # On Windows, prefer pythonw.exe if available so it runs as a native GUI subsystem
+        # process without ever allocating a console window.
+        dirname, filename = os.path.split(python_exe)
+        if filename.lower() == "python.exe":
+            pythonw = os.path.join(dirname, "pythonw.exe")
+            if os.path.isfile(pythonw):
+                python_exe = pythonw
+
+        # Use CREATE_NO_WINDOW and hide the window via STARTUPINFO.
+        # (Note: Win32 CreateProcess docs specify CREATE_NO_WINDOW must NOT be combined with DETACHED_PROCESS).
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        popen_kwargs["startupinfo"] = startupinfo
     else:
+        # On Linux/POSIX, start_new_session=True detaches the child from the controlling terminal
+        # and session group via setsid().
         popen_kwargs["start_new_session"] = True
 
     try:
         subprocess.Popen(
-            [sys.executable, "-m", "worlds.halo3.cleanup", str(mcc_pid), dxgi_path],
+            [python_exe, "-m", "worlds.halo3.cleanup", str(mcc_pid), dxgi_path],
             **popen_kwargs,
         )
         logger.info(f"[Watchdog] Detached cleanup supervisor spawned for MCC PID {mcc_pid}.")
@@ -365,7 +387,7 @@ def spawn_watchdog(mcc_pid: int, dxgi_path: str) -> None:
 
 def get_mcc_pid() -> int:
     """Return the PID of an active MCC-Win64-Shipping.exe process, or 0 if not found."""
-    target_exes = {"mcc-win64-shipping.exe", "mcclauncher.exe"}
+    target_exes = {"mcc-win64-shipping.exe"}
     if sys.platform == "win32" and ctypes is not None:
         kernel32 = ctypes.windll.kernel32
         h_snap = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
@@ -420,7 +442,30 @@ def get_mcc_pid() -> int:
         return 0
 
 
-def launch_mcc(mcc_dir: Optional[str] = None) -> Optional[subprocess.Popen]:
+class LaunchedProcess:
+    """Represents an active MCC process when launched externally (e.g. via Steam protocol URL)."""
+
+    def __init__(self, pid: int, popen: Optional[subprocess.Popen] = None) -> None:
+        self.pid = pid
+        self._popen = popen
+
+    def poll(self) -> Optional[int]:
+        if self._popen:
+            return self._popen.poll()
+        return None if is_mcc_running() else 0
+
+    def terminate(self) -> None:
+        if self._popen:
+            self._popen.terminate()
+
+    def __bool__(self) -> bool:
+        return self.pid > 0
+
+    def __repr__(self) -> str:
+        return f"<LaunchedProcess pid={self.pid}>"
+
+
+def launch_mcc(mcc_dir: Optional[str] = None) -> Optional[subprocess.Popen | LaunchedProcess]:
     """Complete launch workflow:
 
     1. Detects MCC installation path.
@@ -457,7 +502,7 @@ def launch_mcc(mcc_dir: Optional[str] = None) -> Optional[subprocess.Popen]:
 
     # Step 3: Launch MCC Anti-Cheat Disabled
     is_steam = "steam" in mcc_dir.lower()
-    proc: Optional[subprocess.Popen] = None
+    proc: Optional[subprocess.Popen | LaunchedProcess] = None
     mcc_pid: int = 0
 
     if is_steam:
@@ -470,8 +515,8 @@ def launch_mcc(mcc_dir: Optional[str] = None) -> Optional[subprocess.Popen]:
                 os.startfile("steam://launch/976730/option2")
             else:
                 subprocess.Popen(["steam", "steam://launch/976730/option2"])
-            # Wait for MCC process to initialize (up to 15 seconds)
-            for _ in range(30):
+            # Wait for MCC process to initialize (up to 20 seconds)
+            for _ in range(40):
                 time.sleep(0.5)
                 mcc_pid = get_mcc_pid()
                 if mcc_pid > 0:
@@ -500,4 +545,13 @@ def launch_mcc(mcc_dir: Optional[str] = None) -> Optional[subprocess.Popen]:
     if mcc_pid > 0:
         spawn_watchdog(mcc_pid, dxgi_dest)
 
-    return proc
+    if proc is not None:
+        return proc
+    if mcc_pid > 0:
+        return LaunchedProcess(mcc_pid)
+    if is_mcc_running():
+        active_pid = get_mcc_pid()
+        if active_pid > 0:
+            return LaunchedProcess(active_pid)
+
+    return None

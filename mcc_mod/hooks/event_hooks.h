@@ -55,6 +55,9 @@ extern AwardSecondarySkull_t g_originalAwardSecondarySkull;
 extern void*                 g_targetAwardSecondarySkull;
 void __fastcall Detour_AwardSecondarySkull(int32_t playerDatum, int32_t skullIndex);
 
+// Direct pickup / inventory skull award verification (called from unit_add_weapon and inventory tick)
+void CheckAndAwardSkullIfHolding(uintptr_t halo3Base, uint32_t playerDatum, void* weaponObj, void* tagDef);
+
 // --- Mission Completion Detection & Auto-Return-To-Menu ---
 // game_won (+0x1F2F7C): HS impl called when a campaign mission is beaten.
 // Our detour emits a "game_won" event and then calls game_save_and_quit to

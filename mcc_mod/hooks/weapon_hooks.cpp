@@ -1,4 +1,5 @@
 #include "weapon_hooks.h"
+#include "event_hooks.h"
 #include "../engine/tag_system.h"
 #include "../engine/object_table.h"
 #include "../memory_utils.h"
@@ -61,7 +62,13 @@ bool __fastcall Detour_WeaponEvaluateCandidate(uint32_t playerIndex, uint32_t we
                 weaponDatum, wname ? wname : "unknown", tagIndex, (int)IsTagUnlocked(g_halo3Base, tagIndex, tagDef, true));
 
             if (!IsTagUnlocked(g_halo3Base, tagIndex, tagDef, true)) {
-                return false; // Suppress candidate! Prompt will not show!
+                if (!ChiefHasAnyWeapon(g_halo3Base)) {
+                    LOG_ONCE_PER_DATUM(unarmed_eval_bypass, weaponDatum,
+                        "[weapon_candidate] Chief is unarmed! Allowing candidate '%s' (0x%04X) as emergency starter.",
+                        wname ? wname : "unknown_weapon", tagIndex);
+                } else {
+                    return false; // Suppress candidate! Prompt will not show!
+                }
             }
         }
     }
@@ -80,10 +87,16 @@ bool __fastcall Detour_CanTradeWithAlly(uint32_t unitDatum, uint32_t weaponDatum
             void* tagDef = GetTagDefinition(g_halo3Base, tagDatum);
             if (!IsTagUnlocked(g_halo3Base, tagIndex, tagDef, true)) {
                 const char* wname = GetWeaponNameFromTag(tagIndex, tagDef);
-                LOG_ONCE_PER_DATUM(blocked_trade, weaponDatum,
-                    "[can_trade_with_ally] BLOCKED trade/pickup of locked weapon '%s' (0x%04X, weapon=0x%08X) for unit 0x%08X",
-                    wname ? wname : "unknown", tagIndex, weaponDatum, unitDatum);
-                return false; // Suppress candidate Action 2 from ever being created!
+                if (!ChiefHasAnyWeapon(g_halo3Base)) {
+                    LOG_ONCE_PER_DATUM(unarmed_trade_bypass, weaponDatum,
+                        "[can_trade_with_ally] Chief is unarmed! Allowing trade '%s' (0x%04X) as emergency starter.",
+                        wname ? wname : "unknown_weapon", tagIndex);
+                } else {
+                    LOG_ONCE_PER_DATUM(blocked_trade, weaponDatum,
+                        "[can_trade_with_ally] BLOCKED trade/pickup of locked weapon '%s' (0x%04X, weapon=0x%08X) for unit 0x%08X",
+                        wname ? wname : "unknown", tagIndex, weaponDatum, unitDatum);
+                    return false; // Suppress candidate Action 2 from ever being created!
+                }
             }
         }
     }
@@ -145,6 +158,7 @@ bool __fastcall Detour_unit_can_pickup_weapon(uint32_t unitDatum, uint32_t weapo
         // ONLY gate the local player! NPCs (marines, grunts, brutes) must be free to equip all weapons!
         if (IsPlayerUnit(g_halo3Base, unitDatum)) {
             void* weaponObj = GetObjectPtr(g_halo3Base, weaponDatum);
+            void* unitObj = GetObjectPtr(g_halo3Base, unitDatum);
             if (weaponObj) {
                 uint32_t tagDatum = *(uint32_t*)weaponObj;
                 uint16_t tagIndex = (uint16_t)(tagDatum & 0xFFFF);
@@ -170,6 +184,10 @@ bool __fastcall Detour_unit_can_pickup_weapon(uint32_t unitDatum, uint32_t weapo
                         LOG_ONCE_PER_DATUM(crate_bypass, weaponDatum,
                             "[can_pickup] Bypass pass-through: locked '%s' (0x%04X, weapon=0x%08X) at caller +0x%llX",
                             wname ? wname : "unknown", tagIndex, weaponDatum, (unsigned long long)callerOffset);
+                    } else if (unitObj ? !UnitHasAnyWeapon(unitObj) : !ChiefHasAnyWeapon(g_halo3Base)) {
+                        LOG_ONCE_PER_DATUM(unarmed_pickup_bypass, weaponDatum,
+                            "[can_pickup] Chief is unarmed! Allowing '%s' (0x%04X, weapon=0x%08X) as emergency starter.",
+                            wname ? wname : "unknown", tagIndex, weaponDatum);
                     } else {
                         LOG_ONCE_PER_DATUM(blocked_can_pickup, weaponDatum,
                             "[can_pickup] BLOCKED locked weapon '%s' (0x%04X, weapon=0x%08X) for player 0x%08X (caller=+0x%llX)",
@@ -202,10 +220,17 @@ bool __fastcall Detour_unit_update_weapon_prompt(uint32_t unitDatum, void* candi
                 const char* wname = GetWeaponNameFromTag(tagIndex, tagDef);
 
                 if (!IsTagUnlocked(g_halo3Base, tagIndex, tagDef, true)) {
-                    LOG_ONCE_PER_DATUM(blocked_prompt, weaponDatum,
-                        "[weapon_prompt] SUPPRESSED HUD prompt for locked '%s' (0x%04X, datum=0x%08X) for player 0x%08X",
-                        wname ? wname : "unknown", tagIndex, weaponDatum, unitDatum);
-                    return false; // Suppress prompt rendering completely!
+                    void* unitObj = GetObjectPtr(g_halo3Base, unitDatum);
+                    if (unitObj ? !UnitHasAnyWeapon(unitObj) : !ChiefHasAnyWeapon(g_halo3Base)) {
+                        LOG_ONCE_PER_DATUM(unarmed_prompt_bypass, weaponDatum,
+                            "[weapon_prompt] Chief is unarmed! Showing HUD prompt for '%s' (0x%04X, datum=0x%08X)",
+                            wname ? wname : "unknown", tagIndex, weaponDatum);
+                    } else {
+                        LOG_ONCE_PER_DATUM(blocked_prompt, weaponDatum,
+                            "[weapon_prompt] SUPPRESSED HUD prompt for locked '%s' (0x%04X, datum=0x%08X) for player 0x%08X",
+                            wname ? wname : "unknown", tagIndex, weaponDatum, unitDatum);
+                        return false; // Suppress prompt rendering completely!
+                    }
                 } else {
                     LOG_ONCE_PER_DATUM(allowed_prompt, weaponDatum,
                         "[weapon_prompt] ALLOWED HUD prompt for unlocked '%s' (0x%04X, datum=0x%08X) for player 0x%08X",
@@ -246,12 +271,19 @@ bool __fastcall Detour_unit_action_pickup_weapon(uint32_t unitDatum, void* inter
                 void* tagDef = GetTagDefinition(g_halo3Base, tagDatum);
                 const char* wname = GetWeaponNameFromTag(tagIndex, tagDef);
 
-                // 1. If weapon is locked, block auto-pickup!
+                // 1. If weapon is locked, block auto-pickup unless Chief is unarmed
                 if (!IsTagUnlocked(g_halo3Base, tagIndex, tagDef, true)) {
-                    LOG_ONCE_PER_DATUM(auto_blocked, weaponDatum,
-                        "[action_pickup_weapon] SUPPRESSED auto-pickup for locked '%s' (0x%04X, weapon=0x%08X) on player 0x%08X!",
-                        wname ? wname : "unknown", tagIndex, weaponDatum, unitDatum);
-                    return false; // Suppress auto-pickup so reload and animations are never interrupted!
+                    void* unitObj = GetObjectPtr(g_halo3Base, unitDatum);
+                    if (unitObj ? !UnitHasAnyWeapon(unitObj) : !ChiefHasAnyWeapon(g_halo3Base)) {
+                        LOG_ONCE_PER_DATUM(unarmed_action_pickup_bypass, weaponDatum,
+                            "[action_pickup_weapon] Chief is unarmed! Allowing auto-pickup for '%s' (0x%04X, weapon=0x%08X) on player 0x%08X!",
+                            wname ? wname : "unknown", tagIndex, weaponDatum, unitDatum);
+                    } else {
+                        LOG_ONCE_PER_DATUM(auto_blocked, weaponDatum,
+                            "[action_pickup_weapon] SUPPRESSED auto-pickup for locked '%s' (0x%04X, weapon=0x%08X) on player 0x%08X!",
+                            wname ? wname : "unknown", tagIndex, weaponDatum, unitDatum);
+                        return false; // Suppress auto-pickup so reload and animations are never interrupted!
+                    }
                 }
 
                 // 2. Unlocked weapons are allowed through to the original action handler
@@ -279,10 +311,12 @@ bool __fastcall Detour_unit_add_weapon(uint32_t unitDatum, uint32_t weaponDatum,
                 void* tagDef = GetTagDefinition(g_halo3Base, tagDatum);
                 const char* wname = GetWeaponNameFromTag(tagIndex, tagDef);
 
+                // Direct campaign skull check: if Chief equips a skull, award it immediately!
+                CheckAndAwardSkullIfHolding(g_halo3Base, unitDatum, weaponObj, tagDef);
+
                 if (!IsTagUnlocked(g_halo3Base, tagIndex, tagDef, true)) {
-                    // Check if Chief is currently completely unarmed (e.g. initial spawn on The Ark)
-                    uint32_t* inv = (uint32_t*)((uintptr_t)unitObj + Halo3Offsets::H3_UNIT_INVENTORY);
-                    bool chiefHasWeapon = (inv && (inv[0] != 0xFFFFFFFF || inv[1] != 0xFFFFFFFF));
+                    // Check if Chief is currently completely unarmed (e.g. initial spawn on The Ark / Crow's Nest)
+                    bool chiefHasWeapon = UnitHasAnyWeapon(unitObj);
                     if (!chiefHasWeapon) {
                         Log("[unit_add_weapon] Chief is unarmed! Allowing '%s' (0x%04X) as emergency starter weapon.",
                             wname ? wname : "unknown_weapon", tagIndex);

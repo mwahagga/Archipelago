@@ -47,6 +47,9 @@ ITEM_NAME_TO_ID: dict[str, int] = {
     "Energy Sword License": 117037,
     "Gravity Hammer License": 117038,
 
+    # Player Upgrades (117040)
+    "Progressive Shield Upgrade": 117040,
+
     # Filler Items (117050)
     "Moa Burger": 117050,
 }
@@ -126,6 +129,9 @@ DEFAULT_ITEM_CLASSIFICATIONS: dict[str, ItemClassification] = {
     "Energy Sword License": ItemClassification.progression,
     "Gravity Hammer License": ItemClassification.progression,
 
+    # Player Upgrades
+    "Progressive Shield Upgrade": ItemClassification.progression,
+
     # Fillers
     "Moa Burger": ItemClassification.filler,
 }
@@ -197,8 +203,22 @@ def create_all_items(world: Halo3World) -> None:
             if tier_name != starter_tier:
                 itempool.append(world.create_item(tier_name))
 
-    # 3. Fill any remaining unfilled locations with filler equipment items
+    # 3. Shield Upgrades according to shield_progression
+    shield_mode = world.options.shield_progression.value
+    shield_counts = {
+        1: 3,  # progressive: 25% base + 3 upgrades -> 100%
+        2: 7,  # progressive_overshield: 25% base + 7 upgrades -> 300% (Triple Overshield)
+        3: 4,  # glass_cannon: 0% base + 4 upgrades -> 100%
+        4: 8,  # glass_cannon_overshield: 0% base + 8 upgrades -> 300% (Triple Overshield)
+    }
+    num_shields = shield_counts.get(shield_mode, 0)
     unfilled = len(world.multiworld.get_unfilled_locations(world.player))
+    remaining_space = max(0, unfilled - len(itempool))
+    actual_shields = min(num_shields, remaining_space)
+    for _ in range(actual_shields):
+        itempool.append(world.create_item("Progressive Shield Upgrade"))
+
+    # 4. Fill any remaining unfilled locations with filler equipment items
     needed_filler = unfilled - len(itempool)
     for _ in range(max(0, needed_filler)):
         itempool.append(world.create_filler())

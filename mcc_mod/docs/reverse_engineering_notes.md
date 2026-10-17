@@ -19,9 +19,30 @@ During research and development, several candidate hook points and gating strate
 * **Intended Role**: Intercept the central UI action handler when "Start Game" was clicked.
 * **Why it failed**: MinHook places a 5-byte `JMP` trampoline in the function prologue. In MCC, the Scaleform / Unreal Engine UI framework uses stack walking and register state to perform mouse hit-testing and input dispatching. Detouring `+0x512B90` caused Windows to drop mouse clicks throughout the campaign menus (clicking missions, difficulty, or options stopped responding), even though arrow keys and gamepad navigation continued to work.
 
-#### ❌ `MCC + 0x50E1E4` — `CampaignLobby::CommitSelectionOrCountdown`
-* **Intended Role**: Block countdown initiation by intercepting selection commits.
-* **Why it failed**: This function is shared across multiple menu operations. In particular, it is called to commit list selection changes when the user clicks a different mission in the campaign missions list. Detouring it and returning early prevented new mission selections from registering, locking the player onto whatever level was previously selected (e.g. Crow's Nest).
+#### ✅ `MCC + 0x50E1E4` — `CampaignLobby::CommitSelection` (Phase 1 Mission Selection Gating)
+* **Signature**: `void __fastcall (void* lobby)`
+* **Role**: Intercepts mission and option selection commits when clicking items in the Campaign Lobby.
+* **Mechanism**:
+  - Checks if `[lobby + 0x2464] == 0x6FDD6E37` (Campaign Mission Select screen state).
+  - Queries the clicked list item via Scaleform controller at `lobby + 0x910`:
+    1. `listCtrl = (*(uintptr_t*)(lobby + 0x910)->vtbl[0xF0/8])(lobby + 0x910, 0, 0)`
+    2. `item = (MCC + 0x4BC600)(listCtrl)`
+    3. `missionIndex = (*(uintptr_t*)item->vtbl[0x160/8])(item)`
+  - Maps `missionIndex` (0..10) to Archipelago scenario ID.
+  - If locked: returns immediately without invoking original function. MCC aborts updating `[lobby + 0x247C]`, leaving the lobby firmly locked to the previously unlocked mission.
+  - If unlocked (or screen state != `0x6FDD6E37`): passes through to `g_originalCommitSelection(lobby)` so all other menu interactions (difficulty, skulls, rally points, back navigation) function unimpeded.
+
+#### ✅ `MCC + 0x509C24` — `CampaignLobby::InitializeLevel` (Preselection Gating & Auto-Redirection)
+* **Signature**: `void __fastcall (void* lobby, void* rdx)`
+* **Role**: Intercepts initial level configuration when entering Campaign Lobby.
+* **Mechanism**:
+  - Executes original function to allow standard MCC profile reading.
+  - Inspects `[lobby + 0x247C]` (the profile's saved last-played mission index).
+  - If the preselected mission is **locked** in Archipelago:
+    1. Evaluates all unlocked missions via `GetFirstUnlockedMissionIndex()`.
+    2. Overwrites `[lobby + 0x247C]` with the unlocked index (e.g. Sierra 117 = 1).
+    3. Invokes `CampaignLobby::UpdateSelectedMission` (`MCC + 0x50B2AC`) to trigger MCC's native Scaleform UI refresh, instantly updating mission title, description, and graphics.
+  - Ensures players never enter the lobby sitting on a locked level.
 
 #### ❌ `MCC + 0x512F25` & `+0x512FCC` — `CampaignLobby::CountdownUIAnimationTrigger`
 * **Intended Role**: Bypass the countdown timer by detouring the timer animation trigger.
@@ -73,12 +94,60 @@ During research and development, several candidate hook points and gating strate
   - `0x044563CE` — Checkpoint Overwrite Confirmation
   - `0xF221ECB1` — Frame Tick (~60 Hz)
   - `0x687F2B16` — Mouse Hover / Motion
-* **Potential future approaches** (not yet attempted):
-  1. **Scaleform movie creation interception**: Hook `GFx::Loader::CreateMovie` or the movie initialization path to get a `GFx::Movie*` pointer, then call `Invoke("removeMovieClip")` or modify array elements through the vtable after population completes.
-  2. **SWF file modification**: Locate and modify the campaign lobby SWF files in MCC's data packages to remove unwanted UI elements at the Flash level.
-  3. **Input simulation**: Programmatically navigate past unwanted menus by sending synthetic keyboard/controller inputs to auto-select "Halo 3" → "BUILT IN" → "MISSIONS".
-  4. **ExternalInterface callback hooking**: Scaleform Flash movies communicate with C++ through ExternalInterface callbacks. Hooking the ExternalInterface registration or dispatch could provide visibility into Flash→C++ communication.
-* **Important note**: Mouse input is NOT affected by MinHook detouring at these addresses (confirmed safe across all tests). The mouse-breaking issue is specific to `+0x512B90` (ActionDispatcher) and `+0x50E1E4` (CommitSelectionOrCountdown) which participate in the Scaleform event loop.
+* **Phase 2 Investigation & Architectural Breakthrough (Scaleform Flash Menus)**:
+  - **Live Trace Verification**:
+    - `UIScreenManagerBase::UIMessage` (`MCC + 0x8AD5E0`) and `MainMenuBeta::ActionDispatcher` (`MCC + 0x587CB4`) were hooked and monitored live during full menu navigation: `Campaigns → Halo 3 (Carousel) → BUILT IN → Submenu (Resume/Quickstart/Missions/Playlists)`.
+    - **Result**: Zero hits occurred during the first three clicks. C++ code in `MCC-Win64-Shipping.exe` is **not called at all** during carousel and submenu browsing.
+    - All intermediate animations and transitions (`slideInAnim`, `slideOutAnim`, `mMenuBar1`, `mMenuBar2`) are executed **100% internally by ActionScript 3** inside Scaleform Flash (`mainmenubeta.gfx`).
+    - The C++ layer is only invoked when "MISSIONS" is clicked, which closes `MainMenuBeta` and constructs `CampaignLobby`.
+  - **Sequence of Messages Fired on Lobby Entry (Captured via Caller RIP)**:
+    1. `0x7FF6B5889D74` (`MCC + 0x509D74`) — `CampaignLobby::InitializeLevel` (Msg `0xBE694F97`)
+    2. `0x7FF6B5C2A3E2` (`MCC + 0x8AA3E2`) — Scaleform animation timer / Game ID confirmation (`0xF30ABC9E`, `param1 = 1`)
+    3. `0x7FF6B588ABF2` (`MCC + 0x50ABF2`) — `CampaignLobby` tab initialization (Msg `0x2159153E`)
+    4. `0x7FF6B5892639` (`MCC + 0x512639`) — `CampaignLobby::ActionDispatcher` (Msg `0x2159153E`)
+    5. `0x7FF6B568C935` (`MCC + 0x30C935`) — Async resource completion callback (`0x808CE1BC`)
+    6. `0x7FF6B568D1F2` (`MCC + 0x30D1F2`) — Mission list display activator (`0x06C0D5E7`)
+  - **Dual UI Architecture in Modern MCC (PC vs Legacy)**:
+    - **Outer Menus (Unreal Engine 4 UMG Widgets)**:
+      - In the modern PC release of MCC, 343 migrated the outer frontend menus (Main Menu, Campaign Game Carousel, Content Type, and Submenus) to **Unreal Engine 4 UMG widgets** (`WBP_MainMenu`, `WBP_ButtonListMenu`, `WBP_MenuOption`, etc.) stored inside `mcc\Content\Paks\MCC-WindowsNoEditor.pak`.
+      - Loose files like `mainmenubeta.gfx` are legacy Xbox One Scaleform files that modern MCC no longer reads during outer menu navigation.
+    - **Inner Game Lobbies (Scaleform GFx Flash Movies)**:
+      - The actual game lobbies remain 100% **Scaleform GFx**:
+        - `Data\UI\Screens\CampaignLobby.gfx` (Campaign Lobby & Mission Select)
+        - `Data\UI\Screens\WidgetArray.gfx` (List item & carousel widgets)
+        - `Data\UI\Screens\Fonts\Fonts_EN.gfx` (Font library)
+        - `Data\UI\Screens\GlobalOverlay.gfx` (Navigation buttons & spinner)
+      - These files are loaded directly from disk via Windows `CreateFileW` when entering a lobby.
+    - **Universal Localization Database (`Data\UI\Localization\EN_Global.bin`)**:
+      - Both Unreal Engine 4 UMG widgets and Scaleform Flash movies query `EN_Global.bin` for display text.
+      - Contains all menu strings: `"CAMPAIGNS"`, `"BUILT IN"`, `"MISSIONS"`, `"Halo 3"`, etc., indexed by localization tokens (e.g. `$CHOOSE_DIFFICULTY`, `$CAMPAIGN_DIFFICULTY_TOOLTIP`).
+      - Loaded at startup via `CreateFileW`, making it an ideal target for VFS string redirection.
+  - **Winning Architecture: Virtual File System (VFS) Redirection Hook**:
+    - `dxgi.dll` installs a MinHook detour on `KernelBase!CreateFileW` and `KernelBase!CreateFileA`.
+    - When MCC requests any UI screen (`.gfx`), widget, or localization database (`EN_Global.bin`), the hook transparently redirects the file handle to `mcc\binaries\win64\ui_override\<filename>` if present.
+    - **Zero Steam files on disk are modified**, keeping the game installation completely pristine.
+  - **Live In-Engine Verification**:
+    - Created test override `ui_override\CampaignLobby.gfx` with `DIFFICULTY` replaced by `ARCHIPELAG`.
+    - **Result**: MCC transparently redirected `CampaignLobby.gfx` on the fly (`[VFS] >>> REDIRECTING (W)` in logs).
+    - **In-Game Confirmation**: The settings panel in the Campaign Lobby visibly rendered **`$CHOOSE_ARCHIPELAG`** and **`$CAMPAIGN_ARCHIPELAG_TOOLTIP`** directly on screen with 0 crashes, confirming live Scaleform code execution.
+  - **Modern MCC Outer Menu Navigation Architecture (Unreal Engine 4)**:
+    - **Data Table Architecture (`DT_MainMenuData`)**:
+      - Extracted and reverse-engineered from `mcc\Content\Paks\MCC-WindowsNoEditor.pak` (`DT_MainMenuData.uasset` / `DT_MainMenuData.uexp`, 329 rows).
+      - Controls the frontend menu structure, buttons, categories, and routing across all 6 games.
+    - **Core Enums Identified (`EMenuType` & `EMCCFeatureID`)**:
+      - `EMenuType::Ca_Halo3 = 18 (0x12)`: Campaign Content Type selection menu (BUILT IN vs MODS).
+      - `EMenuType::Ca_Halo3_BuiltIn = 19 (0x13)`: Intermediate Submenu (Resume / QuickStart / Missions / Playlists).
+      - `EMenuType::Ca_Halo3_Missions = 51 (0x33)`: Direct Campaign Mission Select Lobby (`CampaignLobby.gfx`).
+      - `EMCCFeatureID::CampaignGameplay = 9`: Used by Content Type and Submenu buttons.
+      - `EMCCFeatureID::CampaignMissionSelect = 10`: Direct mission select feature action.
+    - **Postmortems of Investigated Frontend Hooks**:
+      - ❌ `MCC + 0x52F000`: Disassembly revealed strings for `FileShareGameTypeSmall` (file share browser, completely unrelated to Campaign navigation; 0 hits during frontend clicks).
+      - ❌ `MCC + 0x8AA228`: `UIScreenBase::Tick(float deltaTime)` per-frame update loop. Ticks continuously at ~60 Hz regardless of user input. Inside this tick, `0x8AA3CA` fires message `0xF30ABC9E` only after a transition has already been queued.
+      - ❌ `MCC + 0x270B120`: State synchronization / path processor for menu trees. Detouring and overriding `[RCX + 0x7C]` at this site did not trigger menu navigation (0 hits), indicating that menu transitions are dispatched upstream in UE4's widget delegates.
+    - **Winning Strategy & Current State**:
+      - Top-level string rebranding (`CAMPAIGNS` $\rightarrow$ `ARCHIPELAGO`, `BUILT IN` $\rightarrow$ `MISSIONS`) is 100% complete and working in-engine via VFS-redirected `Data\UI\Localization\EN_Global.bin`.
+      - Mission gating and preselection override is 100% complete and working in-engine via `CampaignLobby::InitializeLevel` (`0x509CD6`) and `CommitSelection` (`0x50E1E4`).
+      - Next objective: Bypass intermediate menus (`Ca_Halo3` and `Ca_Halo3_BuiltIn`) so selecting Halo 3 transitions straight into `Ca_Halo3_Missions` (Mission Select).
 
 ---
 
@@ -253,14 +322,16 @@ When a map loads, MCC maps `halo3.dll` into the process address space. A backgro
   - Emits `terminal_<index>:<scenario>` to `pendingEvents`.
   - Supported by `CheckPendingTerminals()` called in `Detour_Halo3EngineStep` on each simulation tick to poll `campaignStruct + 0x132` as an extra safeguard against missing any terminal reads.
 
-### 11. Skull Award Hooks (`halo3.dll + 0x136088` & `+0x136580`)
+### 11. Skull Award Hooks & Direct Pickup Detection (`halo3.dll + 0x136088`, `+0x136580`, `CheckAndAwardSkullIfHolding`)
 * **Signatures**:
   - Primary: `void __fastcall AwardPrimarySkull(int32_t playerDatum, int32_t skullIndex)` (`+0x136088`)
   - Secondary: `void __fastcall AwardSecondarySkull(int32_t playerDatum, int32_t skullIndex)` (`+0x136580`)
-* **Role**: The true engine functions that award metagame skulls when picked up in campaign.
-* **Logic**:
-  - Parameters: `playerDatum` in `ecx`, `skullIndex` in `edx`.
-  - Queues `skull_primary_<index>:<scenario>` or `skull_secondary_<index>:<scenario>` to notify `Halo3Client.py`.
+  - Direct Verification: `void CheckAndAwardSkullIfHolding(uintptr_t halo3Base, uint32_t playerDatum, void* weaponObj, void* tagDef)`
+* **Role**: Detects when skulls are acquired in campaign and emits Archipelago location check events.
+* **Root Cause & Script Bypass**:
+  - In vanilla Halo 3, the engine functions `award_primary_skull` (`+0x136088`) and `award_secondary_skull` (`+0x136580`) are **only called by Bungie's HS scripts** (`gs_award_primary_skull`), which wait in a loop `(sleep_until (unit_has_weapon ...))`.
+  - In vanilla maps, Bungie guarded this script behind `(if (and (>= (game_difficulty_get) normal) (== (campaign_survival_insertion_zone_get) 0)) ...)`. If loaded on Easy or from a mid-mission rally point, the script was never started!
+  - **Resolution**: `CheckAndAwardSkullIfHolding()` intercepts weapon equips (`Detour_unit_add_weapon`) and player inventory simulation ticks (`CheckAndEnforcePlayerInventory`). When Chief holds any weapon with `weaponType == 11` (`_weapon_type_ball`), the mod checks the current scenario and `name_index` (`*(uint16_t*)(weaponObj + 0xE8)`), resolving the exact primary or secondary skull independently of HS scripts. It then invokes `Detour_AwardPrimarySkull()` / `Detour_AwardSecondarySkull()` directly, ensuring skulls unlock on any difficulty, rally point, or enemy drop.
 
 ### 12. Mission Completion Hook (`halo3.dll + 0x1F2F7C`)
 * **Signature**: `void __fastcall GameWon(void* rcxParam, int32_t edxParam)`
@@ -547,5 +618,248 @@ MCC campaign menus run in Scaleform GFx. C++ interacts with Flash via ActionScri
 * **The Fix**:
   1. In `DllMain` (`mcc_mod/mod_main.cpp`), check `lpReserved != nullptr`. During process termination, do NOT call `RemoveHooks()`, `MH_Uninitialize()`, or `FreeRealDXGI()`; per Microsoft guidance, allow the OS kernel to instantly and cleanly reclaim the entire address space.
   2. In `RemoveHalo3Hooks()` (`mcc_mod/hook_manager.cpp`), guard all unhooking and patch reversals with `GetModuleHandleA("halo3.dll") == (HMODULE)g_halo3Base` and `VirtualQuery(pPatch, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT`.
+
+
+---
+
+## 8. Modern MCC Menu Navigation Architecture (Unreal Engine 4 & DataTables)
+
+### 8.1 Dual UI Architecture
+* **Outer Menus**: Driven by Unreal Engine 4 UMG widgets (`WBP_MainMenu`, `WBP_ButtonListMenu`) referencing data table `/Game/UI/Features/MainMenu/DT_MainMenuData` packed inside `MCC-WindowsNoEditor.pak`.
+* **Inner Lobbies & In-Game Screens**: Driven by Scaleform GFx Flash (`Data\UI\Screens\CampaignLobby.gfx`).
+
+### 8.2 `DT_MainMenuData` Row Hierarchy & Navigation Routing
+`DT_MainMenuData` contains 563 rows (`Row1` to `Row563`), typed as `FMenuData`. Each button in the top-level menus evaluates a target `EMenuType` to decide which widget/screen to display next:
+
+* **`EMenuType` Integer Enums**:
+  * Values are spaced in clean multiples of 10 (`0x0A`) for each game:
+    * **Halo 1**: `0x00` (`Ca_Halo1`), `0x01` (`Ca_Halo1_BuiltIn`), `0x02` (`Ca_Halo1_Missions`)
+    * **Halo 2**: `0x0A` (`Ca_Halo2`), `0x0B` (`Ca_Halo2_BuiltIn`), `0x0C` (`Ca_Halo2_Missions`)
+    * **Halo 3**: `0x14` (`Ca_Halo3`), `0x15` (`Ca_Halo3_BuiltIn`), `0x16` (`Ca_Halo3_Missions`)
+    * **ODST**: `0x1E` (`Ca_Halo3ODST`), `0x1F` (`Ca_Halo3ODST_BuiltIn`), `0x20` (`Ca_Halo3ODST_Missions`)
+    * **Halo 4**: `0x28` (`Ca_Halo4`), `0x29` (`Ca_Halo4_BuiltIn`), `0x2A` (`Ca_Halo4_Missions`)
+    * **Reach**: `0x32` (`Ca_HaloReach`), `0x33` (`Ca_HaloReach_BuiltIn`), `0x34` (`Ca_HaloReach_Missions`)
+
+* **Carousel Rows (`Row11`–`Row16`)**:
+  * Define the top-level Campaign carousel buttons.
+  * `Row13` (`Offset 0x2F61` in `.uexp`): Halo 3 Campaign button.
+    * Vanilla target: `EMenuType::Ca_Halo3` (`0x70` serialized FName index).
+    * When changed to `EMenuType::Ca_Halo3_Missions` (`0x72`), clicking Halo 3 in the carousel bypasses both the Content Type screen and the Submenu, jumping directly into `CampaignLobby.gfx`.
+
+* **Submenu Rows (`Row194`–`Row199`)**:
+  * Define the Campaign Content Type buttons ("BUILT IN" vs "MODS").
+  * `Row196` (`Offset 0x2EF9B` in `.uexp`): Halo 3 Built-In submenu definition.
+    * Vanilla target: `EMenuType::Ca_Halo3_BuiltIn` (`0x71` serialized FName index).
+    * When changed to `EMenuType::Ca_Halo3_Missions` (`0x72`), clicking "BUILT IN" (rebranded to "MISSIONS") skips the Submenu and jumps straight into `CampaignLobby.gfx`.
+
+
+### 8.4 FeatureID Action Dispatch Limitation in Carousels
+* In `DT_MainMenuData.uexp`, changing `FeatureID` in `Row13` (`+0x31EE`) from `EMCCFeatureID::Halo3Campaign` (`0x2C`) to `EMCCFeatureID::CampaignMissionSelect` (`0x17`) did **not** bypass the submenu.
+* **Root Cause**: In Unreal Engine 4's top-level Carousel widget (`WBP_ButtonListMenu`), card click events inspect `MenuType` first. If any rows in `DT_MainMenuData` define `ParentMenuType == Row.MenuType` (which all submenu items do), UE4 treats the card as a folder node and transitions to the submenu screen, ignoring the leaf `FeatureID` action.
+
+### 8.5 Postmortem: Promoted Submenu Row (Row39 Experiment)
+During early testing, an alternative routing was tested:
+1. `Row13` (native Halo 3 card) was hidden by setting `PlatformVisibility = XBOX_ONLY` (`0x5A`).
+2. `Row39` (the submenu "Missions" button) was promoted to the Carousel by setting `ParentMenuType = Campaign` (`0x9F`).
+
+#### Why It Successfully Bypassed Submenus
+Because `Row39` has `MenuType = Ca_Halo3_Missions` (which has no children), UE4 treated it as a terminal action and immediately opened `CampaignLobby.gfx` (Halo 3 Mission Select) on click, completely skipping the Content Type screen and Submenu.
+
+#### Why the Title Still Said "MISSIONS"
+* An attempt was made to rename the card by patching the ASCII bytes at `PAK_UEXP_BASE + 0x9899` (`"MISSIONS"` $\rightarrow$ `"HALO 3  "`).
+* In UE4's `FMenuData`, offset `0x9899` is part of the **`NarratedText`** property (used solely by accessibility screen readers / TTS).
+* The visual text rendered on screen is driven by **`CategoryName`** (at offset `0x96ED` in `Row39`), which references the localization token **`$CHAPTERS`** (resolving to `"MISSIONS"`).
+* Furthermore, `Row39` lacks the Halo 3 logo art and banner graphics associated with `Row13`.
+
+### 8.6 The 2-Byte MenuType Swap Architecture (Option A)
+To retain the native "Halo 3" title (`$HALO_3_TITLE`), logo, artwork, and carousel order while achieving the direct lobby jump:
+
+#### The TMap Key Collision Solution
+* In `DT_MainMenuData`, `MenuType` serves as the primary key for UE4's `TMap<EMenuType, FMenuData>`.
+* Modifying a Carousel row's `MenuType` in isolation to its `_Missions` enum caused an engine assertion crash (`Fatal Error`) because the native submenu button also possessed that same enum value.
+* By **swapping** the values between the Carousel row and Submenu row simultaneously, zero duplicate keys exist in the `TMap`.
+* **Visual Presentation**: Each game card remains in the Carousel with its native title, artwork, and logo.
+* **Navigation**: Clicking any game card directly triggers its `_Missions` action, bypassing all intermediate submenus directly into that game's mission select lobby (`CampaignLobby.gfx`).
+
+| Game | Carousel Row | Carousel `MenuType` Offset | Submenu Row | Submenu `MenuType` Offset | Carousel Enum Swap | Submenu Enum Swap |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Reach**  | `Row10` | `+0x236B` (`0x261940F84`) | `Row24` | `+0xD60C` (`0x26194C225`) | `0x8E` $\rightarrow$ `0x90` | `0x90` $\rightarrow$ `0x8E` |
+| **Halo 1** | `Row11` | `+0x2767` (`0x261941380`) | `Row29` | `+0x571D` (`0x261944336`) | `0x5C` $\rightarrow$ `0x5E` | `0x5E` $\rightarrow$ `0x5C` |
+| **Halo 2** | `Row12` | `+0x2B65` (`0x26194177E`) | `Row34` | `+0x76D9` (`0x2619462F2`) | `0x66` $\rightarrow$ `0x68` | `0x68` $\rightarrow$ `0x66` |
+| **Halo 3** | `Row13` | `+0x2F61` (`0x261941B7A`) | `Row39` | `+0x9693` (`0x2619482AC`) | `0x70` $\rightarrow$ `0x72` | `0x72` $\rightarrow$ `0x70` |
+| **ODST**   | `Row14` | `+0x3350` (`0x261941F69`) | `Row44` | `+0xB64D` (`0x26194A266`) | `0x7A` $\rightarrow$ `0x7C` | `0x7C` $\rightarrow$ `0x7A` |
+| **Halo 4** | `Row15` | `+0x374D` (`0x261942366`) | `Row49` | `+0xF5CB` (`0x26194E1E4`) | `0x84` $\rightarrow$ `0x86` | `0x86` $\rightarrow$ `0x84` |
+
+
+### 8.7 Dynamic Multi-Game Visibility & Archipelago Slot Gating
+Because each game remains represented by its native Carousel row (`Row10` through `Row15`), showing or hiding games based on Archipelago unlock state is handled directly by each row's `PlatformVisibility` byte:
+
+| Game | Carousel Row | `.uexp` Offset | PAK File Offset | Unlocked (`BOTH`) | Locked (`XBOX_ONLY`) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Reach**  | `Row10` | `+0x25DC` | `0x2619411F5` | `0x58` | `0x5A` |
+| **Halo 1** | `Row11` | `+0x29DA` | `0x2619415F3` | `0x58` | `0x5A` |
+| **Halo 2** | `Row12` | `+0x2DD6` | `0x2619419EF` | `0x58` | `0x5A` |
+| **Halo 3** | `Row13` | `+0x31C5` | `0x261941DDE` | `0x58` | `0x5A` |
+| **ODST**   | `Row14` | `+0x35C2` | `0x2619421DB` | `0x58` | `0x5A` |
+| **Halo 4** | `Row15` | `+0x39B1` | `0x2619425CA` | `0x58` | `0x5A` |
+
+Setting a locked game's `PlatformVisibility` to `0x5A` completely removes that game's card from the PC Carousel. When unlocked via the Archipelago server, restoring `0x58` displays the game card immediately.
+
+### 8.8 Main Menu Pruning & Streamlining
+To achieve a minimal, dedicated frontend experience, non-essential modes are pruned directly from the PC Main Menu by changing their `PlatformVisibility` byte from `0x58` (`BOTH`) to `0x5A` (`XBOX_ONLY`):
+
+| Menu Option | DataTable Row | `.uexp` Offset | PAK File Offset | Patched Value |
+| :--- | :--- | :--- | :--- | :--- |
+| **Multiplayer** | `Row3` | `+0x0A8D` | `0x26193F6A6` | `0x5A` (`XBOX_ONLY`) |
+| **Creative (Create)** | `Row4` | `+0x0E76` | `0x26193FA8F` | `0x5A` (`XBOX_ONLY`) |
+| **Firefight** | `Row5` | `+0x1268` | `0x26193FE81` | `0x5A` (`XBOX_ONLY`) |
+| **Cross-Game Playlists** | `Row16` | `+0x3DB4` | `0x2619429CD` | `0x5A` (`XBOX_ONLY`) |
+
+This leaves only the rebranded **ARCHIPELAGO** entry alongside standard utility buttons (Player Hub, Extras, Quit) on the Main Menu.
+
+### 8.9 Dynamic Gating Postmortem & UE4 Slate Widget Lifecycle
+During investigation into dynamic slot gating (showing games only when an Archipelago session unlocks them), we discovered a fundamental constraint in MCC's frontend UI architecture:
+1. **Boot-Time Deserialization & Widget Instantiation**:
+   * When MCC boots, UE4 deserializes `DT_MainMenuData` (`/Game/UI/Features/MainMenu/DT_MainMenuData`) from `MCC-WindowsNoEditor.pak`.
+   * The campaign carousel widget (`WBP_ButtonListMenu`) instantiates its child button widgets during its initial `Event Construct` / creation sequence based on the initial DataTable contents.
+   * If any game rows have `PlatformVisibility = XBOX_ONLY` (`0x5A`) at boot, UE4 creates exactly 0 child button widgets for those games.
+2. **In-Memory DataTable vs. Slate Widget Tree**:
+   * Modifying `PlatformVisibility` bytes in RAM *after* boot (inside the deserialized `FMenuData` row in `UDataTable::RowMap`) does **not** trigger Slate / UMG to instantiate new child button widgets.
+   * When backing out of the menu and re-clicking **ARCHIPELAGO**, the game simply plays an animation and flips visibility on the already-instantiated `WBP_ButtonListMenu` widget; it does not reconstruct the button list from the DataTable.
+   * Consequently, games hidden at boot remain absent even if in-memory DataTable rows are subsequently toggled.
+3. **Background Scanning Risks**:
+   * Running background threads to scan heap memory for `UDataTable` / `FMenuData` during engine boot is hazardous; unthrottled memory sweeps across dynamic heap allocations can encounter access violations or race conditions with UE4's memory manager.
+
+### 8.10 Current Frontend Presentation & Future Gating
+* **Current Presentation**:
+  * All 6 mainline games (**Reach**, **Halo 1**, **Halo 2**, **Halo 3**, **ODST**, **Halo 4**) are visible in the Carousel.
+  * Cross-game playlists (`Row16`) are pruned via PAK patch `PAK_UEXP_BASE + 0x3DB4 = 0x5A`.
+  * Multiplayer, Creative, and Firefight are pruned from the Main Menu.
+  * Clicking any game card directly launches that game's mission select lobby (`CampaignLobby.gfx`) via the 2-byte MenuType swap.
+* **Potential Approaches for Future Dynamic Gating**:
+  * **Slate Widget Visibility Toggling**: Finding the native `UWidget` / `SWidget` pointer in the instantiated UMG tree for locked game buttons and setting `Visibility = EVisibility::Collapsed` / `Visible`.
+  * **Engine Language/Profile Refresh**: Triggering the internal MCC event that forces UE4 to reload or re-construct `WBP_ButtonListMenu` when AP connection state changes.
+
+### 8.11 Lobby Bouncer Architecture & Multi-Game Campaign Gating
+Because `CampaignLobby` (+0x50E1E4, +0x509C24, +0x5137EC) serves all 6 games in MCC, the gating architecture in `lobby_hooks.cpp` operates on a universal multi-game detection model:
+1. **Game Detection & Memory Safety**:
+   * Inspects the lobby header string at `lobby + 0x1E8` matching case variations (`"H3"` / `"HALO3"`, `"Reach"` / `"REACH"`, `"ODST"`, `"H4"` / `"HALO4"`, `"H2"` / `"HALO2"`, `"H1"` / `"HALO1"`).
+   * Falls back to inspecting any chapter token containing `"_Chapter_"` embedded in the lobby struct (e.g. `"$Reach_Chapter_"`, `"$H1_Chapter_"`).
+   * **`VirtualQuery` Memory Safety**: All struct pointer inspections use `IsMemoryReadable()` backed by `VirtualQuery` rather than deprecated APIs like `IsBadReadPtr`. On x64 Windows 10/11, passing non-canonical or unmapped addresses to `IsBadReadPtr` raises fatal access violations; `VirtualQuery` verifies committed readable pages safely without throwing.
+   * Defaults to `MCCGame::Unknown` to prevent unknown or non-H3 lobbies from being mistakenly treated as Halo 3.
+2. **Gating Policy**:
+   * **Disconnected State**: Disconnected players cannot start any campaign mission in any game (`Detour_StartCountdown` blocks launch with `ShowDisconnectedWarning()`).
+   * **Active Game (Halo 3)**: Unlocks are dynamically evaluated against `g_modState.unlockedMissions`. Locked mission clicks are rejected and the Scaleform UI cursor is snapped back via `CampaignLobby::UpdateSelectedMission` (+0x50B2AC).
+   * **Other Games (Reach, CE, H2, ODST, H4)**: In `CommitSelection` and `InitializeLevel`, non-Halo-3 lobbies pass directly through to vanilla MCC without executing Halo 3 UI refresh logic, ensuring selecting other campaigns (e.g. Halo 2) does not crash.
+   * **Option & Skull Selection Preservation**: In `CommitSelection`, only the mission selection screen (`MCC_SCREEN_MISSION_SELECT` / `0x6FDD6E37`) enforces gating. Selecting difficulty, skulls, or controller options passes through cleanly to prevent menu freezing.
+3. **VFS Memory Safety Hardening & CloseHandle Postmortem**:
+   * `Detour_MapViewOfFile` wraps buffer modification in `VirtualQuery` and `VirtualProtect` (`PAGE_WRITECOPY`), preventing `0xC0000005` access violations on read-only mapped pages and eliminating buffer overflow hazards.
+   * **Why `CloseHandle` Must Never Be Hooked**: An attempt to hook `KernelBase!CloseHandle` via MinHook broke game startup. On x64 Windows, `KernelBase!CloseHandle` is an ultra-short 5-byte thunk (`jmp qword ptr [ntdll!NtClose]`). MinHook's 14-byte trampoline overwrites adjacent functions in `KernelBase.dll` and misrelocates the 32-bit RIP displacement, causing an instant crash on the first handle closed. Furthermore, `std::mutex` and CRT synchronization internally invoke `CloseHandle`, triggering recursion. Because MCC opens `MCC-WindowsNoEditor.pak` at boot and holds it open permanently until process termination, handle recycling on the PAK handle does not occur in practice.
+
+### 8.12 Scaleform Carousel Widget Filtering (`UIWidgetArray::AddItem`) & Slate Postmortem
+* **Native Mission Carousel Filtering (`hooks/menu_hooks.cpp`)**:
+  - Rather than attempting to hide buttons via asynchronous Slate reflection, the mod intercepts `UIWidgetArray::AddItem` (RVA `+0x895F54`, pattern `48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 57 48 83 ec 30 41 8b f0 48 8b ea 48 8b f9`).
+  - When the campaign carousel populates, MCC calls `AddItem` for each mission card.
+  - The detour strictly verifies that the item belongs to Halo 3 by validating its vtable (`vt == missionItemVtable`) and index getter (`fn == missionGetIndexFn`).
+  - If the mission scenario is locked in Archipelago, `DetourAddItem` returns `false` without calling the original function, cleanly dropping locked mission cards so only unlocked missions populate the UI carousel.
+* **Why Asynchronous Slate Reflection Was Retired**:
+  - An earlier implementation attempted to manipulate Slate widgets at runtime via `GUObjectArray` and a background worker thread (`CollapseThread`).
+  - UE4 Slate is strictly single-threaded on the game/render thread. Calling `ProcessEvent` on Slate widgets asynchronously while MCC is transitioning between game menus (e.g. selecting Halo 2) causes race conditions and memory corruption crashes.
+  - The in-flight PAK byte patch in `vfs_hooks.cpp` (`DirectMissions` and `FeatureID`) already natively navigates directly to mission selection, making runtime button collapsing obsolete.
+
+### 8.13 Halo Engine Virtual Interface (`IGameEngine`) & `ShellCommand` Teardown
+* **Discovery**:
+  - Every game module in MCC (`halo1.dll`, `halo2.dll`, `halo3.dll`, etc.) exports `CreateGameEngine` and adheres to a common `IGameEngine` virtual method table layout.
+  - In `halo3.dll`:
+    - `CreateGameEngine` is exported at RVA `+0xC2EC`.
+    - Scanning its entry instructions for `MOV [rip + disp32], reg64` reveals the engine global pointer at `halo3.dll + 0xA3CA90`.
+    - The engine vtable is located at `halo3.dll + 0x761B40`.
+* **Vtable Slot Layout**:
+  - Slot 3: `ShellCommand(void* engineObj, int msgType, void* context)` (RVA `+0xB3E8`)
+  - Slot 9: `ShellLevelLoad(void* engineObj, ...)`
+* **Teardown Sequence on `game_won`**:
+  - When `game_won` occurs, instead of patching engine branches or detouring `RestartGameEngine`, `g_quitAfterComplete` flags `DetourShellCommand`.
+  - When the engine attempts to process its post-mission command, the detour intercepts it and executes:
+    1. `g_originalShellCommand(engineObj, 0x0, nullptr)` — Pause simulation.
+    2. `g_originalShellCommand(engineObj, 0xD, nullptr)` — Clean teardown & return to lobby.
+    3. `g_originalShellCommand(engineObj, 0x1, nullptr)` — Resume main loop execution.
+  - This avoids advancing campaign playlists and transitions the engine back to the main menu without any visual artifacts or crashes.
+
+### 8.14 Dynamic Pattern Scanning with Automatic RVA Fallback
+* **Architecture (`pattern_scan.h` / `pattern_scan.cpp`)**:
+  - Pattern strings use IDA-style hex notation with single or double question mark wildcards (e.g. `48 89 5c 24 ? 48 8b da`).
+  - Scans parse module PE headers to inspect the image base and bounds safely.
+  - Data-driven table entries in `hook_manager.cpp` store both the pattern and fallback RVA. If an update shifts code offsets slightly or a signature is matched, the hook targets the scanned address; if a scan misses, it logs a warning and falls back to the hardcoded RVA.
+
+### 8.15 DeathLink Architecture & In-Game Execution
+* **Reverse Engineering & Function Discovery**:
+  - **`object_kill`**: `halo3.dll + 0x34D568`. Signature: `void __fastcall object_kill(uint32_t objectDatum)`.
+    - Discovered via references to the `"unit_kill"` Halo Script (HS) table definition at `halo3.dll + 0x7EBC08`.
+    - Validates `objectDatum != 0xFFFFFFFF`, reads `gs:[0x58]` (Thread Local Storage), looks up the object in the global object table, and executes the engine death sequence, physics ragdoll, and checkpoint reload.
+  - **Unit Vitality Offsets**:
+    - `H3_UNIT_HEALTH` (`+0xF4`): Current unit health float (`1.0f` = full, `<= 0.0f` = dead).
+    - `H3_UNIT_SHIELD` (`+0xF8`): Current unit shield vitality float (`1.0f` = full, `0.0f` = depleted).
+    - `H3_UNIT_RECHARGE_DELAY` (`+0x10C`): 16-bit delay counter; setting to `0` resets shield recharge timer.
+* **Local Death Detection & Safety Lifecycle (`EnforcePlayerShields` in `object_table.cpp`)**:
+  - Runs every frame on the simulation thread (`Halo3EngineStep` hook).
+  - **Spawn Grace Period (`s_spawnGraceTicks = 180`) & Active Gameplay Validation**:
+    - When a new level loads or Chief's entity datum changes, a ~6 second debounce is engaged.
+    - During this period, map loading, scripting, and camera fade-in complete without interference.
+    - DeathLink penalties received while in menus or during loading are safely preserved in `g_pendingDeathLinkEffect` and deferred until Chief has completed spawning, acquired his loadout (`ChiefHasAnyWeapon`), and confirmed vitality (`health > 0.50f`), preventing engine hangs on black loading screens.
+  - **Death Detection**:
+    - Inspects `chiefObj + 0xF4` (`*pHealth`). When `*pHealth <= 0.001f` and Chief was previously confirmed alive (`health > 0.50f`), pushes `"player_death"` into `g_modState.pendingEvents`.
+    - Implements a 200-tick (~7s) cooldown debounce to suppress multiple death events while the corpse ragdolls or reloads a checkpoint.
+  - **Feedback Loop Suppression**:
+    - When an incoming DeathLink executes `kill`, `s_wasChiefAlive` is immediately set to `false` and a 300-tick (~10s) cooldown is asserted in C++. In Python, `is_penalty_death_pending` catches and consumes the event. This guarantees incoming deathlink penalties are never echoed back out to Archipelago as natural local deaths.
+* **In-Game Penalty Dispatch (`Client` $\rightarrow$ `Mod`)**:
+  - The client pushes `"deathlink_pending"` in the JSON payload (`"kill"`, `"shield_break"`, or `"mortal"`).
+  - Penalties received while in menus or loading screens are preserved and execute automatically once gameplay begins.
+  - On the next simulation tick past the grace period once Chief is equipped and alive, `EnforcePlayerShields` consumes the effect atomically:
+    1. **`kill`**: Invokes `object_kill(chiefDatum)` directly via function pointer `halo3.dll + 0x34D568`.
+    2. **`shield_break`**: Sets `*pShield = 0.0f` and resets `H3_UNIT_RECHARGE_DELAY = 0` (instant EMP shield pop).
+    3. **`mortal`**: Sets `*pShield = 0.0f` and `*pHealth = 0.10f` (10% health, one hit from death).
+* **Multiworld Balance & Configuration**:
+  - **`death_link`** (`Toggle`): Enables/disables DeathLink participation.
+  - **`death_link_amnesty`** (`Range`, 0-10): Number of local deaths to forgive before broadcasting a DeathLink to other players.
+  - **`death_link_receive_hits`** (`Range`, 1-5): Number of incoming DeathLinks required before triggering the in-game penalty.
+  - **`death_link_effect`** (`Choice`): Choice of penalty (`Kill`, `Shield Break`, `Mortal`).
+  - Runtime console commands: `/deathlink [on|off]`, `/deathlink effect <name>`, `/deathlink test [effect]`.
+
+### 8.16 Campaign Skull Spawning & Difficulty / Insertion Point Unlocking
+* **Vanilla Behavior & Mechanics**:
+  - In vanilla *Halo 3*, campaign skulls are placed as scenario weapon entities (`objects\weapons\multiplayer\ball\primary_skull.weapon` and `secondary_skull.weapon`).
+  - However, the game engine enforces two strict prerequisites before skulls can be unlocked or credited in campaign:
+    1. Difficulty must be Normal or higher (`difficulty >= 1`). On Easy (`difficulty == 0`), skull eligibility checks fail.
+    2. The mission must be started from the beginning (Rally Point Alpha, `insertion_point == 0`). If launched from mid-mission rally points (Bravo or Charlie), skull checks fail.
+* **State Layout & Structure Offsets**:
+  - `game_state + 0x16c` (`uint16_t`): Campaign difficulty (`0` = Easy, `1` = Normal, `2` = Heroic, `3` = Legendary).
+  - `game_state + 0x16e` (`uint16_t`): Campaign insertion point (`0` = Alpha, `1` = Bravo, `2` = Charlie).
+  - Values are initialized during session setup from `game_options + 0xec` and `+0xee` at `halo3.dll + 0x10c369` / `+0x10c377`.
+* **Engine Check Locations & Native Patches (`offsets.h` & `hook_manager.cpp`)**:
+  1. **Easy Difficulty Skull Eligibility (`H3_SKULL_EASY_DIFFICULTY_PATCH` at `+0x12FF57`)**:
+     - Vanilla instruction: `jl +0x9C` (`0F 8C 9C 00 00 00` — 6 bytes). Checks `difficulty < 1` and branches to return `false`.
+     - Patch: Replaced with 6x NOP (`0x90 0x90 0x90 0x90 0x90 0x90`), allowing skulls to be collected and unlocked on Easy difficulty.
+  2. **Mid-Mission Insertion Point Eligibility (`H3_SKULL_INSERTION_POINT_PATCH` at `+0x12FFCC`)**:
+     - Vanilla instruction: `test r8w, r8w` (`66 45 85 C0` — 4 bytes) followed by `jmp +0xB2`. If insertion point is non-zero (Bravo/Charlie), `jne` at destination branches to return `false`.
+     - Patch: Replaced with `xor r8w, r8w` (`66 45 31 C0` — 4 bytes). Clears the register and asserts ZF=1, ensuring mid-mission starts qualify as eligible.
+  3. **Metagame Difficulty Check (`H3_METAGAME_SKULL_DIFFICULTY_PATCH` at `+0x13627F`)**:
+     - Vanilla instruction: `jle +0x6B` (`7E 6B` — 2 bytes) in `0x136248`. If difficulty is `<= 0` (Easy), jumps over the 9 campaign mission skulls.
+     - Patch: Replaced with 2x NOP (`0x90 0x90`), enabling metagame skull progression on Easy.
+  4. **Mission Conclusion Mid-Mission Start Bypass (`H3_MISSION_COMPLETE_INSERTION_PATCH` at `+0xF03CA`)**:
+     - Vanilla instruction: `jne +0xAC` (`0F 85 AC 00 00 00` — 6 bytes) in `campaign_mission_complete` (`0xF0268`). If `insertion != 0`, skips calling the skull award handler.
+     - Patch: Replaced with 6x NOP (`0x90 0x90 0x90 0x90 0x90 0x90`), ensuring end-of-mission skull credit is granted regardless of starting rally point.
+  5. **In-Flight Physical Skull Spawning via VFS Byte Patching (`vfs_hooks.cpp` -> `PatchMapBuffer`)**:
+     - **Root Cause Analysis & Discovery**:
+       - Inspection of `scnr` (the scenario tag) reveals that skulls are placed in the scenario `Weapons` tagblock (stride `0xA8` = 168 bytes).
+       - In vanilla maps, Bungie set `Placement Flags` Bit 0 (`0x0001` = *"Not Automatically"*) on every skull (flags = `0x00000021` or `0x00000061`).
+       - This flag tells the scenario placement engine: *"Do not automatically spawn this object into the world during map load."*
+       - Instead, vanilla Halo 3 relied on mission HS scripts calling `(object_create "skull_name")`, which explicitly checked `(game_difficulty_get) >= 1` (Normal or higher) and `(game_insertion_point_get) == 0` (Alpha only).
+       - When Bit 0 is cleared (`flags &= ~0x0001`, e.g. `0x21` -> `0x20`), the scenario placement engine treats skulls identically to normal ambient ground weapons, placing them into the level automatically on map load!
+       - **Live In-Game Verification**: Tested live in Sierra 117 on Easy difficulty starting from Rally Point Charlie. Clearing Bit 0 on Element 21 (`skull_iron`) caused the Iron Skull to spawn and appear immediately in-game!
+     - **Native In-Flight VFS Implementation**:
+       - Rather than permanently modifying map files on disk, `vfs_hooks.cpp` intercepts Win32 file I/O (`CreateFileW`/`A`, `ReadFile`, `GetOverlappedResult`, `CreateFileMappingW`, and `MapViewOfFile`).
+       - When MCC reads or maps any campaign map file, `PatchMapBuffer` checks the read range against known skull placement flag offsets across all 9 campaign maps.
+       - It clears Bit 0 in-flight in memory (`0x21` -> `0x20` / `0x61` -> `0x60`), leaving map files on disk 100% stock while guaranteeing automatic skull placement across all difficulties and rally points!
+
 
 

@@ -19,7 +19,7 @@ def log(msg: str) -> None:
 
 def is_mcc_running() -> bool:
     """Return True if any MCC process is currently active."""
-    target_exes = {b"mcc-win64-shipping.exe", b"mcclauncher.exe"}
+    target_exes = {b"mcc-win64-shipping.exe"}
     if sys.platform == "win32":
         import ctypes.wintypes
         kernel32 = ctypes.windll.kernel32
@@ -79,38 +79,42 @@ def wait_for_mcc_exit(initial_pid: int = 0) -> None:
     
     Steam launches MCC by spawning an initial process that immediately handshakes
     and hands off to the main shipping executable (a new PID).
-    Therefore, the watchdog first waits for the initial PID (if active),
-    and then continuously monitors until ALL MCC executables have closed.
+    The watchdog ensures MCC has fully started and is active, then continuously
+    monitors until the main shipping executable has completely exited.
     """
-    if initial_pid > 0:
-        if sys.platform == "win32":
-            kernel32 = ctypes.windll.kernel32
-            h_proc = kernel32.OpenProcess(0x00100000, False, initial_pid)
-            if h_proc:
-                try:
-                    log(f"Watchdog attached to initial MCC PID {initial_pid}. Waiting...")
-                    kernel32.WaitForSingleObject(h_proc, 0xFFFFFFFF)
-                    log(f"Initial MCC PID {initial_pid} completed.")
-                finally:
-                    kernel32.CloseHandle(h_proc)
-        else:
-            log(f"Watchdog attached to initial MCC PID {initial_pid} (Linux). Waiting...")
-            while True:
-                try:
-                    os.kill(initial_pid, 0)
-                    time.sleep(1.0)
-                except OSError:
-                    break
-            log(f"Initial MCC PID {initial_pid} completed.")
+    # 1. Give MCC a grace period to start up if not already running
+    if not is_mcc_running():
+        log(f"Waiting for MCC shipping executable to become active (initial PID {initial_pid})...")
+        startup_timeout = 30.0
+        start_time = time.time()
+        while not is_mcc_running() and (time.time() - start_time) < startup_timeout:
+            time.sleep(0.5)
 
-    # Wait a moment for child/handoff processes to spawn if Steam is launching MCC
+    if not is_mcc_running():
+        log("[WARN] MCC shipping executable was never detected active within startup window.")
+        return
+
+    # 2. If an initial PID was given and valid, wait for it if still alive
+    if initial_pid > 0 and sys.platform == "win32":
+        kernel32 = ctypes.windll.kernel32
+        h_proc = kernel32.OpenProcess(0x00100000, False, initial_pid)
+        if h_proc:
+            try:
+                log(f"Watchdog attached to initial MCC PID {initial_pid}. Waiting...")
+                kernel32.WaitForSingleObject(h_proc, 0xFFFFFFFF)
+                log(f"Initial MCC PID {initial_pid} completed.")
+            finally:
+                kernel32.CloseHandle(h_proc)
+
+    # 3. Monitor until all MCC shipping executables have exited
+    log("MCC shipping process confirmed active. Monitoring until game exit...")
+    while is_mcc_running():
+        time.sleep(1.0)
+
+    # Re-verify after a brief pause to prevent race condition during game shutdown
     time.sleep(2.0)
-
-    # Loop until all MCC processes have fully exited
-    if is_mcc_running():
-        log("MCC shipping/launcher processes are still running. Monitoring until game exit...")
-        while is_mcc_running():
-            time.sleep(1.0)
+    while is_mcc_running():
+        time.sleep(1.0)
 
     log("All MCC processes have terminated.")
 

@@ -64,6 +64,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         break;
     }
     case DLL_PROCESS_DETACH:
+        Halo3AP::StopMonitor();
         if (lpReserved == nullptr) {
             Halo3AP::Log("[Halo3AP Mod] FreeLibrary called on dxgi.dll, but mod is pinned! Preserving hooks.");
             break;

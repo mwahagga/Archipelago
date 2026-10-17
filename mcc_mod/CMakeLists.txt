@@ -15,6 +15,10 @@ add_library(dxgi SHARED
     hooks/weapon_hooks.cpp
     hooks/engine_hooks.cpp
     hooks/event_hooks.cpp
+    hooks/shell_command.cpp
+    hooks/menu_hooks.cpp
+    hooks/vfs_hooks.cpp
+    pattern_scan.cpp
     third_party/minhook/src/hook.c
     third_party/minhook/src/buffer.c
     third_party/minhook/src/trampoline.c
